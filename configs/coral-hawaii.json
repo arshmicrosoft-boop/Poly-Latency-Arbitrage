@@ -2,15 +2,25 @@
   "window_s": 60,
   "heartbeat_s": 30,
   "data_dir": "data",
+  "target_notional_usd": 10.0,
+  "cap_price": 0.95,
+  "taker_fee_bps": 0,
+  "min_depth_usd": 25.0,
+  "min_profit_usd": 1.0,
+  "book_stale_after_s": 120,
+  "origins": {
+    "noaa-hawaii-dhw": {
+      "url": "https://coralreefwatch.noaa.gov/product/vs/data/hawaii.txt",
+      "interval_ms": 5000
+    }
+  },
   "targets": [
     {
       "id": "hawaii-coral-alert1-YES",
-      "token_id": "99781646255041557304244382806771247306996635242714723418869519538561630490785",
-      "note": "Polymarket: Will Hawaii reach Coral Bleaching Alert Level 1 by Dec 31 2026. Resolves YES when NOAA CRW Main Hawaiian Islands DHW (from_90th_HS>1 col) >= 4. Origin appends one row/day (~21:00Z). Current DHW ~0.43 -> no trigger expected; dry run measures book reaction / no-reaction to daily origin updates.",
-      "origin": {
-        "url": "https://coralreefwatch.noaa.gov/product/vs/data/hawaii.txt",
-        "interval_ms": 5000
-      }
+      "origin": "noaa-hawaii-dhw",
+      "yes_token_id": "99781646255041557304244382806771247306996635242714723418869519538561630490785",
+      "note": "Will Hawaii reach Coral Bleaching Alert Level 1 by Dec 31 2026. Unstructured daily text feed: no signal extractor (RawHash default) — fire on any body change. Origin appends ~21:00Z.",
+      "signal": { "kind": "raw_hash" }
     }
   ]
 }

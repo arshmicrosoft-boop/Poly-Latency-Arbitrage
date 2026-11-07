@@ -13,12 +13,29 @@
 //! - post-signal forward walk at +0/+25/+50/+100/+250/+500 ms with
 //!   multi-level VWAP sweeps and PHANTOM_EDGE / EXECUTABLE_EDGE verdicts
 //! - non-blocking logger: bounded channel, drop-and-count, never stalls
+//!
+//! Pass-3 features:
+//! - shared-origin poller dedupe: targets referencing the same origin key
+//!   share ONE poller; each poll result is broadcast to all subscribers
+//!   (fixes N× request load and the USGS 429s from parallel pollers)
+//! - semantic signals: per-target `feeds::Extractor` maps the body to a
+//!   monotonic value (daily max magnitude, tweet counter); races open only
+//!   when the signal INCREASES, suppressing sub-threshold noise (metadata
+//!   hash churn, M1.4 tremors below every bin)
+//! - deterministic bin-boundary routing: when a monotonic signal crosses a
+//!   bin's upper bound the bin is eliminated (YES→$0, NO locks $1) and the
+//!   forward walk runs on the bin's NO asks (`BIN_ELIMINATED`); crossing the
+//!   lower bound of the unbounded top bin walks its YES asks
+//!   (`TOP_BIN_LOCKED`); entering a bounded bin mid-window is tagged
+//!   `PROVISIONAL_SHIFT` (not a deterministic lock). `RAW_HASH` is the
+//!   legacy body-hash fallback for unstructured feeds.
 
 mod book;
 mod walk;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -66,6 +83,11 @@ enum Cmd {
 
 #[derive(Deserialize)]
 struct Config {
+    /// Named origin endpoints. Targets referencing the same key share ONE
+    /// poller (pass 3): N bins on one feed cost one request per interval,
+    /// not N — this is what keeps aggregate USGS load under its ~1 req/s
+    /// 429 threshold.
+    origins: HashMap<String, OriginCfg>,
     targets: Vec<Target>,
     #[serde(default = "default_window")]
     window_s: u64,
@@ -119,19 +141,46 @@ fn default_stale() -> u64 {
 }
 
 #[derive(Deserialize)]
-struct Target {
-    id: String,
-    token_id: String,
-    #[serde(default)]
-    note: Option<String>,
-    origin: OriginCfg,
-}
-
-#[derive(Deserialize)]
 struct OriginCfg {
+    /// Poll URL. May contain the `{now_utc}` placeholder, replaced with the
+    /// current UTC timestamp (second precision) on every poll. That is the
+    /// CloudFront cache-bust for FDSN: repeat polls of an identical URL
+    /// return `X-Cache: Hit` bodies up to `max-age=60` stale, while a fresh
+    /// `endtime` value forces a Miss (verified by 10-poll probe
+    /// 2026-11-07). Extra junk params are rejected 400 by FDSN, so a real
+    /// filtering param must carry the variance.
     url: String,
     #[serde(default = "default_interval")]
     interval_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct Target {
+    id: String,
+    #[serde(default)]
+    note: Option<String>,
+    /// Key into `Config::origins`; targets sharing a key share one poller.
+    origin: String,
+    /// Semantic signal extractor (pass 3). Defaults to RawHash: fire on any
+    /// body-hash change (legacy behavior for unstructured feeds).
+    #[serde(default)]
+    signal: feeds::Extractor,
+    /// Bin bounds on the extracted signal. `upper_bound: Some(u)` ⇒ an
+    /// eliminable bin: once signal ≥ u the bin's YES is deterministically
+    /// $0 and its NO locks to $1 (walk the NO asks). `upper_bound: None`
+    /// with `lower_bound: Some(l)` ⇒ the unbounded top bin: signal ≥ l
+    /// locks its YES (walk the YES asks). Bounds are half-open `[lower,
+    /// upper)` — magnitudes are compared after rounding to 1 decimal, so
+    /// the "5.3 to 5.4" bracket is [5.3, 5.5).
+    #[serde(default)]
+    lower_bound: Option<f64>,
+    #[serde(default)]
+    upper_bound: Option<f64>,
+    yes_token_id: String,
+    /// NO-side ERC-1155 token. Required for every bounded bin: bin-
+    /// elimination races walk THIS token's asks, not the YES side.
+    #[serde(default)]
+    no_token_id: Option<String>,
 }
 
 fn default_interval() -> u64 {
@@ -154,6 +203,33 @@ fn now_wall_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Seconds since Unix epoch → `YYYY-MM-DDTHH:MM:SS` (UTC). Hand-rolled
+/// civil-from-days (Howard Hinnant's public-domain algorithm) to avoid a
+/// chrono dependency for one format string.
+fn utc_stamp(epoch_secs: u64) -> String {
+    let days = (epoch_secs / 86_400) as i64;
+    let tod = epoch_secs % 86_400;
+    let (h, m, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y0 = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if mo <= 2 { y0 + 1 } else { y0 };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}")
 }
 
 /// Append-only JSONL logger behind a bounded channel: the hot path only
@@ -218,6 +294,69 @@ fn first_url(hay: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// How a signal increase routes onto a bin (pass 3). See module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalClass {
+    /// Signal crossed this bounded bin's upper bound ⇒ YES is $0, NO locks
+    /// to $1 deterministically. Walk the NO asks.
+    BinEliminated,
+    /// Signal crossed the unbounded top bin's lower bound ⇒ its YES locks.
+    /// Walk the YES asks.
+    TopBinLocked,
+    /// Signal entered a bounded bin without exiting it: the bin got more
+    /// likely but nothing is locked yet. Walk YES asks, tagged provisional —
+    /// the analyzer reports these separately from deterministic walks.
+    ProvisionalShift,
+    /// Legacy body-hash race (unstructured feed). Walk YES asks.
+    RawHash,
+}
+
+impl SignalClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            SignalClass::BinEliminated => "BIN_ELIMINATED",
+            SignalClass::TopBinLocked => "TOP_BIN_LOCKED",
+            SignalClass::ProvisionalShift => "PROVISIONAL_SHIFT",
+            SignalClass::RawHash => "RAW_HASH",
+        }
+    }
+}
+
+/// Deterministic bin-boundary routing for one signal increase `old → new`.
+/// Bounds are half-open `[lower, upper)`; `new` is the extractor's rounded
+/// value, so `new >= upper` means the bin cannot win. A jump that crosses
+/// both bounds resolves to elimination (the stronger, deterministic claim).
+/// Returns `None` when no boundary relevant to THIS bin was crossed (the
+/// signal moved inside the bin, or the bin was already settled).
+fn route_crossing(
+    lower: Option<f64>,
+    upper: Option<f64>,
+    old: f64,
+    new: f64,
+) -> Option<SignalClass> {
+    match upper {
+        Some(u) => {
+            if old < u && new >= u {
+                return Some(SignalClass::BinEliminated);
+            }
+            if let Some(l) = lower {
+                if old < l && new >= l && new < u {
+                    return Some(SignalClass::ProvisionalShift);
+                }
+            }
+            None
+        }
+        None => {
+            let l = lower?;
+            if old < l && new >= l {
+                Some(SignalClass::TopBinLocked)
+            } else {
+                None
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -300,6 +439,13 @@ async fn list(max_pages: u32, regex: Option<String>, url_only: bool, zero_delay:
 struct Pending {
     origin_id: u64,
     target_idx: usize,
+    /// Token whose asks are walked and whose book movement resolves the
+    /// race — the side a trade would actually hit: the NO token for
+    /// BIN_ELIMINATED, the YES token otherwise.
+    walk_token_id: String,
+    signal_class: &'static str,
+    old_signal: Option<f64>,
+    new_signal: Option<f64>,
     t0: Instant,
     t0_wall_ms: u128,
     uncertainty_ms: Option<u128>,
@@ -316,8 +462,10 @@ struct Pending {
 const WALK_OFFSETS_MS: [u64; 6] = [0, 25, 50, 100, 250, 500];
 
 struct OriginMsg {
-    target_idx: usize,
-    ev: feeds::OriginEvent,
+    origin_idx: usize,
+    /// Shared across all subscribers of this origin: one poll, one body,
+    /// N extractors.
+    ev: Arc<feeds::OriginEvent>,
 }
 
 async fn watch(path: PathBuf) -> Result<()> {
@@ -329,13 +477,33 @@ async fn watch(path: PathBuf) -> Result<()> {
     if cfg.targets.is_empty() {
         anyhow::bail!("config has no targets");
     }
+    for t in &cfg.targets {
+        if !cfg.origins.contains_key(&t.origin) {
+            anyhow::bail!("target '{}' references unknown origin key '{}'", t.id, t.origin);
+        }
+        if t.upper_bound.is_some() && t.no_token_id.is_none() {
+            anyhow::bail!(
+                "target '{}' is a bounded bin but has no no_token_id — bin-elimination walks need the NO side",
+                t.id
+            );
+        }
+    }
     std::fs::create_dir_all(&cfg.data_dir)?;
     let log_path = std::path::Path::new(&cfg.data_dir).join(format!("race-{}.jsonl", now_wall_ms()));
     let log = std::sync::Arc::new(Jsonl::create(&log_path, 8192)?);
     info!(log = %log_path.display(), targets = cfg.targets.len(), "session start");
 
     let client = clob::client()?;
-    let token_ids: Vec<String> = cfg.targets.iter().map(|t| t.token_id.clone()).collect();
+    // Deduped token universe: every YES token plus every NO token — bin-
+    // elimination walks NO asks, so both sides need book coverage.
+    let mut token_ids: Vec<String> = Vec::new();
+    for t in &cfg.targets {
+        for tok in std::iter::once(&t.yes_token_id).chain(t.no_token_id.as_ref()) {
+            if !token_ids.contains(tok) {
+                token_ids.push(tok.clone());
+            }
+        }
+    }
 
     // Initialize book trackers from REST snapshots.
     let mut books: HashMap<String, BookTracker> = HashMap::new();
@@ -370,13 +538,33 @@ async fn watch(path: PathBuf) -> Result<()> {
         }
     });
 
-    // One poller task per target.
+    // Shared-origin poller dedupe (pass 3, Task 1): one poller per origin
+    // KEY, in first-reference order; each poll result is broadcast to every
+    // subscribed target. N bins on one feed ⇒ one request per interval.
+    let mut origin_order: Vec<String> = Vec::new();
+    let mut origin_targets: Vec<Vec<usize>> = Vec::new();
+    for (ti, t) in cfg.targets.iter().enumerate() {
+        match origin_order.iter().position(|k| k == &t.origin) {
+            Some(oi) => origin_targets[oi].push(ti),
+            None => {
+                origin_order.push(t.origin.clone());
+                origin_targets.push(vec![ti]);
+            }
+        }
+    }
+    info!(
+        origins = origin_order.len(),
+        targets = cfg.targets.len(),
+        "pollers spawned (deduped by origin key)"
+    );
     let (origin_tx, mut origin_rx) = tokio::sync::mpsc::channel::<OriginMsg>(256);
-    for (i, t) in cfg.targets.iter().enumerate() {
+    for (oi, key) in origin_order.iter().enumerate() {
+        let o = &cfg.origins[key];
+        let url_template = o.url.clone();
         let mut poller = feeds::HttpPoller::new(
             client.clone(),
-            t.origin.url.clone(),
-            Duration::from_millis(t.origin.interval_ms),
+            o.url.clone(),
+            Duration::from_millis(o.interval_ms),
         );
         let tx = origin_tx.clone();
         let interval = poller.interval;
@@ -386,13 +574,19 @@ async fn watch(path: PathBuf) -> Result<()> {
                 let scheduled = ticker.tick().await;
                 // tokio::time::Instant -> std::time::Instant (feeds crate
                 // uses std monotonic throughout, spec §3).
-                match poller.poll_once(scheduled.into()).await {
+                let res = if url_template.contains("{now_utc}") {
+                    let url = url_template.replace("{now_utc}", &utc_stamp(now_epoch_secs()));
+                    poller.poll_url(scheduled.into(), &url).await
+                } else {
+                    poller.poll_once(scheduled.into()).await
+                };
+                match res {
                     Ok(ev) => {
-                        if tx.send(OriginMsg { target_idx: i, ev }).await.is_err() {
+                        if tx.send(OriginMsg { origin_idx: oi, ev: Arc::new(ev) }).await.is_err() {
                             return;
                         }
                     }
-                    Err(e) => warn!(target = i, error = %e, "origin poll failed"),
+                    Err(e) => warn!(origin = oi, error = %e, "origin poll failed"),
                 }
             }
         });
@@ -408,14 +602,25 @@ async fn watch(path: PathBuf) -> Result<()> {
         "min_depth_usd": cfg.min_depth_usd,
         "min_profit_usd": cfg.min_profit_usd,
         "book_stale_after_s": cfg.book_stale_after_s,
+        "origins": origin_order.iter().enumerate().map(|(oi, k)| json!({
+            "key": k,
+            "url": cfg.origins[k].url,
+            "interval_ms": cfg.origins[k].interval_ms,
+            "subscribers": origin_targets[oi].len()
+        })).collect::<Vec<_>>(),
         "targets": cfg.targets.iter().map(|t| json!({
-            "id": t.id, "token_id": t.token_id, "origin": t.origin.url,
-            "interval_ms": t.origin.interval_ms, "note": t.note
+            "id": t.id, "origin": t.origin,
+            "signal": format!("{:?}", t.signal),
+            "lower_bound": t.lower_bound, "upper_bound": t.upper_bound,
+            "yes_token_id": t.yes_token_id, "no_token_id": t.no_token_id,
+            "note": t.note
         })).collect::<Vec<_>>(),
     }));
 
     let mut pending: Vec<Pending> = Vec::new();
     let mut origin_seq: u64 = 0;
+    // Last extracted signal per target; `None` until the baseline poll.
+    let mut last_signal: Vec<Option<f64>> = vec![None; cfg.targets.len()];
     let stale_after = Duration::from_secs(cfg.book_stale_after_s.max(10));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     // Forward-walk offsets need sub-tick resolution: the spec's +0/+25/+50 ms
@@ -427,7 +632,18 @@ async fn watch(path: PathBuf) -> Result<()> {
     let mut heartbeat = tokio::time::interval(Duration::from_secs(cfg.heartbeat_s.max(5)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    let mut last_quotes: HashMap<String, (Option<f64>, Option<f64>)> = HashMap::new();
+    // Heartbeat covers both sides of every bin (walks may hit either).
+    let hb_tokens: Vec<(String, String)> = cfg
+        .targets
+        .iter()
+        .flat_map(|t| {
+            let mut v = vec![(format!("{}#YES", t.id), t.yes_token_id.clone())];
+            if let Some(n) = &t.no_token_id {
+                v.push((format!("{}#NO", t.id), n.clone()));
+            }
+            v
+        })
+        .collect();
 
     loop {
         tokio::select! {
@@ -447,14 +663,14 @@ async fn watch(path: PathBuf) -> Result<()> {
                     clob::ws::WsEvent::Book { asset_id, bids, asks } => {
                         let tracker = books.entry(asset_id.clone()).or_default();
                         tracker.load_snapshot(&bids, &asks);
-                        on_quotes(&log, &cfg, &mut pending, &mut last_quotes, &asset_id, tracker, recv_at);
+                        on_quotes(&log, &cfg, &mut pending, &asset_id, tracker, recv_at);
                     }
                     clob::ws::WsEvent::PriceChange { asset_id, changes } => {
                         if let Some(tracker) = books.get_mut(&asset_id) {
                             for c in changes {
                                 tracker.apply_change(c.side, c.price, c.size);
                             }
-                            on_quotes(&log, &cfg, &mut pending, &mut last_quotes, &asset_id, tracker, recv_at);
+                            on_quotes(&log, &cfg, &mut pending, &asset_id, tracker, recv_at);
                         }
                     }
                     clob::ws::WsEvent::LastTrade { .. } => {}
@@ -462,13 +678,14 @@ async fn watch(path: PathBuf) -> Result<()> {
                 }
             }
             msg = origin_rx.recv() => {
-                let Some(OriginMsg { target_idx, ev }) = msg else { break };
-                let target = &cfg.targets[target_idx];
-                // Always log origin events (incl. 304s): release-completeness
-                // needs the full poll record, not just changes (spec §9).
+                let Some(OriginMsg { origin_idx, ev }) = msg else { break };
+                let subscribers = &origin_targets[origin_idx];
+                // One origin_event per POLL (shared poller), not per target:
+                // release-completeness needs the full poll record (spec §9).
                 log.emit(json!({
                     "kind": "origin_event",
-                    "target_id": target.id,
+                    "origin_key": origin_order[origin_idx],
+                    "subscribers": subscribers.len(),
                     "status": ev.status,
                     "changed": ev.changed,
                     "body_len": ev.body_len,
@@ -488,42 +705,105 @@ async fn watch(path: PathBuf) -> Result<()> {
                         "date": ev.http_date,
                     },
                 }));
-                if !ev.changed {
-                    continue; // 304 / identical body: nothing to race on
+                if ev.status != 200 {
+                    continue; // 429/5xx: no signal this tick; logged above
                 }
-                origin_seq += 1;
-                let book = books.get(&target.token_id);
-                let (bid, ask) = book
-                    .map(|b| (b.best_bid().map(|q| q.0), b.best_ask().map(|q| q.0)))
-                    .unwrap_or((None, None));
-                let depth_ok = book.map_or(false, |b| {
-                    b.best_ask().map_or(false, |(p, s)| p * s >= cfg.min_depth_usd)
-                });
-                pending.push(Pending {
-                    origin_id: origin_seq,
-                    target_idx,
-                    t0: ev.t_headers_rx,
-                    t0_wall_ms: ev.at.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
-                    uncertainty_ms: ev.uncertainty_ms,
-                    ask_before: ask,
-                    bid_before: bid,
-                    book_health_at_open: book.map_or(BookHealth::Uninitialized, |b| b.health()).as_str(),
-                    walk_offsets_done: 0,
-                    samples: Vec::new(),
-                    book_healthy_all: true,
-                    resolved: false,
-                });
-                log.emit(json!({
-                    "kind": "race_opened",
-                    "origin_id": origin_seq,
-                    "target_id": target.id,
-                    "t0_wall_ms": pending.last().unwrap().t0_wall_ms,
-                    "ask_before": ask,
-                    "bid_before": bid,
-                    "depth_ok_at_open": depth_ok,
-                    "book_health": pending.last().unwrap().book_health_at_open,
-                    "uncertainty_ms": ev.uncertainty_ms,
-                }));
+                for &ti in subscribers {
+                    let target = &cfg.targets[ti];
+                    match target.signal.extract(&ev.body) {
+                        None => {
+                            if matches!(target.signal, feeds::Extractor::RawHash) {
+                                // Legacy path: fire on any body-hash change.
+                                if !ev.changed {
+                                    continue;
+                                }
+                                open_race(
+                                    &log, &cfg, &mut pending, &books, ti,
+                                    target.yes_token_id.clone(), SignalClass::RawHash,
+                                    None, None, &ev, &mut origin_seq,
+                                );
+                            } else {
+                                // Garbage body: never race on a feed we
+                                // cannot read.
+                                log.emit(json!({
+                                    "kind": "signal_parse_failed",
+                                    "target_id": target.id,
+                                    "status": ev.status,
+                                    "body_len": ev.body_len,
+                                }));
+                            }
+                        }
+                        Some(v) => {
+                            let prev = last_signal[ti];
+                            match prev {
+                                None => {
+                                    // First poll establishes the baseline;
+                                    // racing the initial state is noise.
+                                    last_signal[ti] = Some(v);
+                                    log.emit(json!({
+                                        "kind": "signal_baseline",
+                                        "target_id": target.id,
+                                        "value": v,
+                                    }));
+                                    continue;
+                                }
+                                Some(p) if v <= p => {
+                                    // Monotonic signals: no increase ⇒ no
+                                    // race. Suppresses metadata-hash churn
+                                    // and sub-threshold events that move no
+                                    // bin (the pass-3 noise fix).
+                                    continue;
+                                }
+                                Some(_) => {}
+                            }
+                            let old = prev.unwrap();
+                            match route_crossing(target.lower_bound, target.upper_bound, old, v) {
+                                None => {
+                                    // Signal moved inside the bin (e.g. a
+                                    // tweet count tick): no boundary crossed,
+                                    // nothing deterministic to trade.
+                                    last_signal[ti] = Some(v);
+                                    log.emit(json!({
+                                        "kind": "signal_update",
+                                        "target_id": target.id,
+                                        "old": old, "new": v, "routed": null,
+                                    }));
+                                }
+                                Some(cls) => {
+                                    let (walk_token, class) = match cls {
+                                        SignalClass::BinEliminated => {
+                                            let Some(no_tok) = &target.no_token_id else {
+                                                // Checked at config load;
+                                                // keep a guard anyway.
+                                                last_signal[ti] = Some(v);
+                                                warn!(target = %target.id, "BIN_ELIMINATED without no_token_id; skipped");
+                                                continue;
+                                            };
+                                            (no_tok.clone(), SignalClass::BinEliminated)
+                                        }
+                                        SignalClass::TopBinLocked => (target.yes_token_id.clone(), cls),
+                                        SignalClass::ProvisionalShift => (target.yes_token_id.clone(), cls),
+                                        SignalClass::RawHash => {
+                                            unreachable!("route_crossing never returns RawHash")
+                                        }
+                                    };
+                                    last_signal[ti] = Some(v);
+                                    log.emit(json!({
+                                        "kind": "signal_update",
+                                        "target_id": target.id,
+                                        "old": old, "new": v,
+                                        "routed": class.as_str(),
+                                    }));
+                                    open_race(
+                                        &log, &cfg, &mut pending, &books, ti,
+                                        walk_token, class, Some(old), Some(v),
+                                        &ev, &mut origin_seq,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             }
             _ = walk_tick.tick() => {
                 advance_walks(&log, &cfg, &mut pending, &mut books);
@@ -540,6 +820,8 @@ async fn watch(path: PathBuf) -> Result<()> {
                             "kind": "race_timeout",
                             "origin_id": p.origin_id,
                             "target_id": cfg.targets[p.target_idx].id,
+                            "signal_class": p.signal_class,
+                            "walk_token_id": p.walk_token_id,
                             "window_ms": cfg.window_s * 1000,
                             "ask_before": p.ask_before,
                             "bid_before": p.bid_before,
@@ -556,12 +838,14 @@ async fn watch(path: PathBuf) -> Result<()> {
                 }
             }
             _ = heartbeat.tick() => {
-                let quotes: Vec<Value> = cfg.targets.iter().map(|t| {
-                    let (b, a) = last_quotes.get(&t.token_id).copied().unwrap_or((None, None));
-                    let book = books.get(&t.token_id);
+                let quotes: Vec<Value> = hb_tokens.iter().map(|(label, tok)| {
+                    let book = books.get(tok);
+                    let (b, a) = book
+                        .map(|x| (x.best_bid().map(|q| q.0), x.best_ask().map(|q| q.0)))
+                        .unwrap_or((None, None));
                     let health = book.map_or("Missing", |x| x.health().as_str());
                     let age_ms = book.and_then(|x| x.last_update()).map(|u| u.elapsed().as_millis());
-                    json!({"target_id": t.id, "best_bid": b, "best_ask": a, "book_health": health, "book_age_ms": age_ms})
+                    json!({"token_label": label, "best_bid": b, "best_ask": a, "book_health": health, "book_age_ms": age_ms})
                 }).collect();
                 log.emit(json!({
                     "kind": "heartbeat",
@@ -593,6 +877,66 @@ fn sweep_fields(s: &walk::Sweep) -> Value {
     })
 }
 
+/// Snapshot the walk token's book and push a Pending race. `walk_token` is
+/// the side a trade would actually hit: NO asks for BIN_ELIMINATED, YES
+/// asks for TOP_BIN_LOCKED / PROVISIONAL_SHIFT / RAW_HASH.
+fn open_race(
+    log: &Jsonl,
+    cfg: &Config,
+    pending: &mut Vec<Pending>,
+    books: &HashMap<String, BookTracker>,
+    target_idx: usize,
+    walk_token: String,
+    class: SignalClass,
+    old_signal: Option<f64>,
+    new_signal: Option<f64>,
+    ev: &feeds::OriginEvent,
+    origin_seq: &mut u64,
+) {
+    *origin_seq += 1;
+    let target = &cfg.targets[target_idx];
+    let book = books.get(&walk_token);
+    let (bid, ask) = book
+        .map(|b| (b.best_bid().map(|q| q.0), b.best_ask().map(|q| q.0)))
+        .unwrap_or((None, None));
+    let depth_ok = book.map_or(false, |b| {
+        b.best_ask().map_or(false, |(p, s)| p * s >= cfg.min_depth_usd)
+    });
+    pending.push(Pending {
+        origin_id: *origin_seq,
+        target_idx,
+        walk_token_id: walk_token.clone(),
+        signal_class: class.as_str(),
+        old_signal,
+        new_signal,
+        t0: ev.t_headers_rx,
+        t0_wall_ms: ev.at.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        uncertainty_ms: ev.uncertainty_ms,
+        ask_before: ask,
+        bid_before: bid,
+        book_health_at_open: book.map_or(BookHealth::Uninitialized, |b| b.health()).as_str(),
+        walk_offsets_done: 0,
+        samples: Vec::new(),
+        book_healthy_all: true,
+        resolved: false,
+    });
+    log.emit(json!({
+        "kind": "race_opened",
+        "origin_id": *origin_seq,
+        "target_id": target.id,
+        "signal_class": class.as_str(),
+        "walk_token_id": walk_token,
+        "old_signal": old_signal,
+        "new_signal": new_signal,
+        "t0_wall_ms": pending.last().unwrap().t0_wall_ms,
+        "ask_before": ask,
+        "bid_before": bid,
+        "depth_ok_at_open": depth_ok,
+        "book_health": pending.last().unwrap().book_health_at_open,
+        "uncertainty_ms": ev.uncertainty_ms,
+    }));
+}
+
 /// Advance forward-walk sampling for all pending races at the fixed spec
 /// offsets (+0/+25/+50/+100/+250/+500 ms) and emit a verdict once all six
 /// samples are in. Runs on the 20 ms walk tick so sample offsets actually
@@ -610,13 +954,12 @@ fn advance_walks(
     let mut i = 0;
     while i < pending.len() {
         let elapsed = now - pending[i].t0;
-        let target_idx = pending[i].target_idx;
-        let token_id = cfg.targets[target_idx].token_id.clone();
+        let walk_token = pending[i].walk_token_id.clone();
 
         while pending[i].walk_offsets_done < WALK_OFFSETS_MS.len() as u32 {
             let off = WALK_OFFSETS_MS[pending[i].walk_offsets_done as usize];
             if elapsed >= Duration::from_millis(off) {
-                let sweep = books.get(&token_id).map_or_else(
+                let sweep = books.get(&walk_token).map_or_else(
                     || walk::sweep_asks(&[], cfg.target_notional_usd, cfg.cap_price, cfg.taker_fee_bps),
                     |b| {
                         if !matches!(b.health(), BookHealth::Healthy | BookHealth::Stale) {
@@ -631,10 +974,12 @@ fn advance_walks(
                 log.emit(json!({
                     "kind": "forward_walk_sample",
                     "origin_id": pending[i].origin_id,
-                    "target_id": cfg.targets[target_idx].id,
+                    "target_id": cfg.targets[pending[i].target_idx].id,
+                    "signal_class": pending[i].signal_class,
+                    "walk_token_id": walk_token,
                     "offset_ms": offset_ms,
                     "sweep": sweep_fields(&sweep),
-                    "book_health": books.get(&token_id).map_or("Missing", |b| b.health().as_str()),
+                    "book_health": books.get(&walk_token).map_or("Missing", |b| b.health().as_str()),
                 }));
                 pending[i].walk_offsets_done += 1;
             } else {
@@ -649,6 +994,10 @@ fn advance_walks(
                 "kind": "forward_walk_verdict",
                 "origin_id": p.origin_id,
                 "target_id": cfg.targets[p.target_idx].id,
+                "signal_class": p.signal_class,
+                "walk_token_id": p.walk_token_id,
+                "old_signal": p.old_signal,
+                "new_signal": p.new_signal,
                 "verdict": verdict.as_str(),
                 "book_healthy_all": p.book_healthy_all,
                 "min_profit_usd": cfg.min_profit_usd,
@@ -660,23 +1009,19 @@ fn advance_walks(
 }
 
 /// Called after every applied book update: logs best-quote moves and resolves
-/// pending races (origin flip happened; did/when did the book move?).
+/// pending races (origin flip happened; did/when did the book move?). Races
+/// resolve on the WALK token — for BIN_ELIMINATED that is the NO side, the
+/// one a trade would actually hit.
 fn on_quotes(
     log: &Jsonl,
     cfg: &Config,
     pending: &mut Vec<Pending>,
-    last_quotes: &mut HashMap<String, (Option<f64>, Option<f64>)>,
     asset_id: &str,
     tracker: &BookTracker,
     recv_at: Instant,
 ) {
     let bid = tracker.best_bid().map(|q| q.0);
     let ask = tracker.best_ask().map(|q| q.0);
-    let prev = last_quotes.insert(asset_id.to_string(), (bid, ask));
-    let changed = prev.map_or(true, |(b, a)| b != bid || a != ask);
-    if !changed {
-        return;
-    }
     log.emit(json!({
         "kind": "book_change",
         "token_id": asset_id,
@@ -685,13 +1030,12 @@ fn on_quotes(
         "book_health": tracker.health().as_str(),
         "recv_ms": wall_of(recv_at),
     }));
-    // Resolve any pending race for targets bound to this token (first
-    // material move). Forward-walk sampling continues regardless — the
-    // verdict comes from the fixed-offset samples, not the first move.
+    // Resolve any pending race walking this token (first material move).
+    // Forward-walk sampling continues regardless — the verdict comes from
+    // the fixed-offset samples, not the first move.
     let mut i = 0;
     while i < pending.len() {
-        let matches_token = !pending[i].resolved
-            && cfg.targets[pending[i].target_idx].token_id == asset_id;
+        let matches_token = !pending[i].resolved && pending[i].walk_token_id == asset_id;
         if matches_token {
             let latency = (recv_at - pending[i].t0).as_millis();
             let material = tracker.best_ask().map_or(false, |(p, s)| {
@@ -702,6 +1046,7 @@ fn on_quotes(
                 "kind": "race",
                 "origin_id": pending[i].origin_id,
                 "target_id": cfg.targets[pending[i].target_idx].id,
+                "signal_class": pending[i].signal_class,
                 "token_id": asset_id,
                 "latency_ms": latency,
                 "material": material,
@@ -714,5 +1059,85 @@ fn on_quotes(
             pending[i].resolved = true;
         }
         i += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_bin_eliminated() {
+        // "5.3 to 5.4" bin = [5.3, 5.5): max crossing 5.5 eliminates it.
+        assert_eq!(
+            route_crossing(Some(5.3), Some(5.5), 5.4, 5.6),
+            Some(SignalClass::BinEliminated)
+        );
+        // A jump across several bins at once still eliminates this bin.
+        assert_eq!(
+            route_crossing(Some(5.3), Some(5.5), 4.6, 6.1),
+            Some(SignalClass::BinEliminated)
+        );
+        // Under-bin (no lower bound): crossing its upper bound eliminates.
+        assert_eq!(
+            route_crossing(None, Some(5.3), 4.6, 5.3),
+            Some(SignalClass::BinEliminated)
+        );
+    }
+
+    #[test]
+    fn route_no_refire_after_settled() {
+        // Already past the upper bound: a further increase crosses nothing
+        // for THIS bin (its elimination race fired on the crossing poll).
+        assert_eq!(route_crossing(Some(5.3), Some(5.5), 5.7, 6.2), None);
+        // Top bin already locked.
+        assert_eq!(route_crossing(Some(6.1), None, 6.3, 6.5), None);
+    }
+
+    #[test]
+    fn route_top_bin_locked() {
+        assert_eq!(
+            route_crossing(Some(6.1), None, 5.9, 6.3),
+            Some(SignalClass::TopBinLocked)
+        );
+        // Exact bound value locks (half-open [lower, ∞)).
+        assert_eq!(
+            route_crossing(Some(6.1), None, 6.0, 6.1),
+            Some(SignalClass::TopBinLocked)
+        );
+    }
+
+    #[test]
+    fn route_provisional_shift() {
+        // Entering a bounded bin without exiting it: more likely, not locked.
+        assert_eq!(
+            route_crossing(Some(5.5), Some(5.7), 5.4, 5.6),
+            Some(SignalClass::ProvisionalShift)
+        );
+        // Crossing the upper bound in the same jump is the deterministic
+        // elimination, not a provisional entry.
+        assert_eq!(
+            route_crossing(Some(5.5), Some(5.7), 5.4, 5.8),
+            Some(SignalClass::BinEliminated)
+        );
+        // Under-bins (no lower bound) are the default state: entering them
+        // is never a provisional shift.
+        assert_eq!(route_crossing(None, Some(5.3), 0.0, 4.9), None);
+    }
+
+    #[test]
+    fn route_no_boundary_crossed() {
+        // Counter ticks within the bin: nothing deterministic to trade.
+        assert_eq!(route_crossing(Some(20.0), Some(40.0), 21.0, 22.0), None);
+        // Already eliminated, counter keeps climbing.
+        assert_eq!(route_crossing(Some(20.0), Some(40.0), 41.0, 42.0), None);
+    }
+
+    #[test]
+    fn utc_stamp_formats() {
+        assert_eq!(utc_stamp(0), "1970-01-01T00:00:00");
+        // 20764 days after epoch = 2026-11-07 (leap-day arithmetic check).
+        assert_eq!(utc_stamp(1_794_009_600), "2026-11-07T00:00:00");
+        assert_eq!(utc_stamp(1_794_009_600 + 86_399), "2026-11-07T23:59:59");
     }
 }

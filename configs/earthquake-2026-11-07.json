@@ -8,24 +8,102 @@
   "min_depth_usd": 25.0,
   "min_profit_usd": 1.0,
   "book_stale_after_s": 120,
+  "origins": {
+    "usgs-fdsn-nov07": {
+      "url": "https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson&starttime=2026-11-07T00:00:00&endtime={now_utc}&minmagnitude=4.0&orderby=time",
+      "interval_ms": 3000
+    }
+  },
   "targets": [
     {
-      "id": "quake-nov07-under-5.3-YES",
-      "token_id": "78087814167373361061467074736844023570431674890748372870118538294333933206927",
-      "note": "Biggest quake Nov 7 < 5.3. Origin flips whenever all_day.geojson gains a quake; a 5.3+ quake flips this NO. Currently the most liquid bin.",
-      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 3000 }
+      "id": "quake-nov07-under-5.3",
+      "origin": "usgs-fdsn-nov07",
+      "signal": {
+        "kind": "usgs_geojson_max_mag",
+        "start_time_utc": "2026-11-07T00:00:00",
+        "end_time_utc": "2026-11-08T00:00:00",
+        "min_mag": 4.0
+      },
+      "lower_bound": null,
+      "upper_bound": 5.3,
+      "yes_token_id": "78087814167373361061467074736844023570431674890748372870118538294333933206927",
+      "no_token_id": "47769611438046936783860129975519453446478422397867998935704819736198414703330",
+      "note": "Under 5.3. Eliminated (NO walks) the instant daily max mag rounds to >= 5.3. This is the deterministic bin-elimination leg."
     },
     {
-      "id": "quake-nov07-6.1-plus-YES",
-      "token_id": "14726163803382932303792110042378235938381878236851660599595684542347634160893",
-      "note": "Biggest quake Nov 7 >= 6.1. A 6.1+ event anywhere on Earth resolves YES; today's max was 6.1 so this bin is live at ~0.15-0.17.",
-      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 3000 }
+      "id": "quake-nov07-5.3-to-5.4",
+      "origin": "usgs-fdsn-nov07",
+      "signal": {
+        "kind": "usgs_geojson_max_mag",
+        "start_time_utc": "2026-11-07T00:00:00",
+        "end_time_utc": "2026-11-08T00:00:00",
+        "min_mag": 4.0
+      },
+      "lower_bound": 5.3,
+      "upper_bound": 5.5,
+      "yes_token_id": "86024789673656468144569236602788053531059694941912982727190154442171973725902",
+      "no_token_id": "84237458966789407677697486669402472031581146377681301739975207226444990925083",
+      "note": "Bracket '5.3 to 5.4' = [5.3, 5.5) on the rounded magnitude. Entering from below is PROVISIONAL_SHIFT; crossing 5.5 is BIN_ELIMINATED."
     },
     {
-      "id": "quake-nov07-5.3-to-5.4-YES",
-      "token_id": "86024789673656468144569236602788053531059694941912982727190154442171973725902",
-      "note": "Biggest quake Nov 7 in [5.3, 5.4]. Narrow bin; any bigger quake resolves NO.",
-      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 3000 }
+      "id": "quake-nov07-5.5-to-5.6",
+      "origin": "usgs-fdsn-nov07",
+      "signal": {
+        "kind": "usgs_geojson_max_mag",
+        "start_time_utc": "2026-11-07T00:00:00",
+        "end_time_utc": "2026-11-08T00:00:00",
+        "min_mag": 4.0
+      },
+      "lower_bound": 5.5,
+      "upper_bound": 5.7,
+      "yes_token_id": "29235218843358941004542672848697879129721841699103406819426501065712128469431",
+      "no_token_id": "11319122275747231475819326988629294352056872129825080483274459492112546965116",
+      "note": "Bracket '5.5 to 5.6' = [5.5, 5.7)."
+    },
+    {
+      "id": "quake-nov07-5.7-to-5.8",
+      "origin": "usgs-fdsn-nov07",
+      "signal": {
+        "kind": "usgs_geojson_max_mag",
+        "start_time_utc": "2026-11-07T00:00:00",
+        "end_time_utc": "2026-11-08T00:00:00",
+        "min_mag": 4.0
+      },
+      "lower_bound": 5.7,
+      "upper_bound": 5.9,
+      "yes_token_id": "28829167870272597095357027480368040738446614982076640779714887856352823109391",
+      "no_token_id": "74600581220083331656058603164492825174935380076500382097841870771104987075816",
+      "note": "Bracket '5.7 to 5.8' = [5.7, 5.9)."
+    },
+    {
+      "id": "quake-nov07-5.9-to-6.0",
+      "origin": "usgs-fdsn-nov07",
+      "signal": {
+        "kind": "usgs_geojson_max_mag",
+        "start_time_utc": "2026-11-07T00:00:00",
+        "end_time_utc": "2026-11-08T00:00:00",
+        "min_mag": 4.0
+      },
+      "lower_bound": 5.9,
+      "upper_bound": 6.1,
+      "yes_token_id": "3803129517294597420686768928177355037181702631018371417949007396548756271342",
+      "no_token_id": "43712307330674240969493387850692213391036602752372130923143089951158354815615",
+      "note": "Bracket '5.9 to 6.0' = [5.9, 6.1)."
+    },
+    {
+      "id": "quake-nov07-6.1-plus",
+      "origin": "usgs-fdsn-nov07",
+      "signal": {
+        "kind": "usgs_geojson_max_mag",
+        "start_time_utc": "2026-11-07T00:00:00",
+        "end_time_utc": "2026-11-08T00:00:00",
+        "min_mag": 4.0
+      },
+      "lower_bound": 6.1,
+      "upper_bound": null,
+      "yes_token_id": "14726163803382932303792110042378235938381878236851660599595684542347634160893",
+      "no_token_id": "1446897238410152751328816064175689328857926235972228225962303812010751863009",
+      "note": "Top bin '6.1 or more' = [6.1, inf). Unbounded: crossing 6.1 is TOP_BIN_LOCKED and walks YES asks."
     }
   ]
 }

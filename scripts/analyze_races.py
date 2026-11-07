@@ -98,6 +98,41 @@ def main(paths):
             print(f"    +{off:>3} ms: mean={statistics.mean(vs):7.2f}  min={min(vs):7.2f}  n={len(vs)}")
         healthy = sum(1 for w in walks if w.get("book_healthy_all"))
         print(f"  book healthy throughout: {healthy}/{len(walks)}")
+
+        # Pass 3: deterministic vs provisional walks, reported separately.
+        # BIN_ELIMINATED/TOP_BIN_LOCKED are deterministic locks ($1 payout);
+        # PROVISIONAL_SHIFT is a mid-window move (no lock yet); RAW_HASH is
+        # the legacy body-hash trigger. Pre-pass-3 logs lack signal_class.
+        groups = [
+            ("DETERMINISTIC", lambda c: c in ("BIN_ELIMINATED", "TOP_BIN_LOCKED")),
+            ("PROVISIONAL", lambda c: c == "PROVISIONAL_SHIFT"),
+            ("RAW_HASH", lambda c: c == "RAW_HASH"),
+            ("UNCLASSIFIED", lambda c: c is None),
+        ]
+        samples_all = [e for e in events if e.get("kind") == "forward_walk_sample"]
+
+        def sid(e):
+            return (e.get("origin_id"), e.get("target_id"))
+
+        print("  by signal class:")
+        for label, pred in groups:
+            gw = [w for w in walks if pred(w.get("signal_class"))]
+            if not gw:
+                continue
+            keys = {sid(w) for w in gw}
+            gs = [s for s in samples_all if sid(s) in keys]
+            tally = {v: sum(1 for w in gw if w.get("verdict") == v)
+                     for v in ("EXECUTABLE_EDGE", "PHANTOM_EDGE", "NO_EDGE")}
+            print(f"    [{label}] n={len(gw)}  " +
+                  "  ".join(f"{v}={c}" for v, c in tally.items() if c))
+            by_off = {}
+            for s in gs:
+                ev = (s.get("sweep") or {}).get("net_if_win")
+                if s.get("offset_ms") is not None and ev is not None:
+                    by_off.setdefault(bucket(s["offset_ms"]), []).append(ev)
+            for off in sorted(by_off):
+                vs = by_off[off]
+                print(f"      +{off:>3} ms: mean={statistics.mean(vs):7.2f}  min={min(vs):7.2f}  n={len(vs)}")
     else:
         print("\n## forward-walk verdicts: none yet")
 
