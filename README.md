@@ -53,6 +53,13 @@ cargo run -p cashcat -- watch --config configs/coral-hawaii.json
   "window_s": 60,        // how long to wait for a book move after origin flip
   "heartbeat_s": 30,
   "data_dir": "data",
+  // Pre-declared spec fields (docs/MEASUREMENT-SPEC.md §5/§6, anti-overfitting):
+  "target_notional_usd": 10.0,  // simulated sweep size
+  "cap_price": 0.95,            // never sweep above this
+  "taker_fee_bps": 0,           // fee on winnings (source claims 2% = 200 bps)
+  "min_depth_usd": 25.0,        // depth required at the quote for a "material" move
+  "min_profit_usd": 1.0,        // net_if_win needed at +100/+250ms for EXECUTABLE_EDGE
+  "book_stale_after_s": 120,    // healthy book with no updates for this long → StaleFeed
   "targets": [{
     "id": "human-readable-id",
     "token_id": "<CLOB ERC-1155 token id of the outcome to track>",
@@ -66,13 +73,16 @@ cargo run -p cashcat -- watch --config configs/coral-hawaii.json
 
 | kind            | meaning                                                       |
 | --------------- | ------------------------------------------------------------- |
-| `session_start` | config echo                                                    |
-| `book_change`   | best bid/ask moved for a tracked token (with `recv_ms`)        |
-| `origin_event`  | origin body changed (sha256 differs from previous poll)        |
-| `race`          | book moved within `window_s` after an origin flip; has `latency_ms` and before/after quotes |
-| `race_timeout`  | no book move within the window; has before quotes              |
-| `heartbeat`     | periodic quotes + pending race count                           |
-| `session_end`   | clean shutdown                                                 |
+| `session_start` | config echo incl. pre-declared spec fields                     |
+| `book_change`   | best bid/ask moved for a tracked token (wall `recv_ms`, `book_health`) |
+| `origin_event`  | every poll (incl. 304s): `changed`, `uncertainty_ms`, stage breakpoints (`stage_ms`), CDN state (`cdn`) |
+| `race_opened`   | origin flip detected; quotes/depth/book-health captured at t0   |
+| `race`          | first book move after an origin flip; `latency_ms` (monotonic), before/after quotes, `material` flag |
+| `forward_walk_sample` | +0…+500 ms offset sweep of the live ask stack (VWAP, cap, fee → `net_if_win`) |
+| `forward_walk_verdict` | `EXECUTABLE_EDGE` / `PHANTOM_EDGE` / `NO_EDGE` per spec   |
+| `race_timeout`  | no verdict within the window; partial samples retained          |
+| `heartbeat`     | quotes, book health + age, pending races, `logger_drops`        |
+| `session_end`   | clean shutdown                                                  |
 
 Note: the first poll of each origin is a baseline "change" and opens a race
 that usually times out — expected noise.
@@ -97,6 +107,16 @@ that usually times out — expected noise.
 - NOAA `hawaii.txt` honours conditional requests: repeat poll with
   `If-None-Match`/`If-Modified-Since` returns `304 Not Modified` (verified
   2026-11-07), so steady-state polling costs headers only.
+- USGS `all_day.geojson` sends `Last-Modified` (no ETag) and honours
+  `If-Modified-Since` with 304, but sits behind CloudFront with
+  `Cache-Control: public, max-age=60` — HIT responses can be up to 60 s
+  stale (spec: measurement void in release windows). The FDSN query
+  endpoint (`/fdsnws/event/1/query`) was observed returning
+  `X-Cache: Miss` (dynamic).
+- First live spec-conformant smoke (2026-11-07, earthquake config): 126/129
+  polls were 304s, uncertainty window p50 ≈ 1.1 s (≈ poll interval), one
+  race resolved at 1,056 ms latency, forward-walk verdicts NO_EDGE, book
+  Healthy throughout, 0 logger drops.
 - First live target: NOAA Coral Reef Watch `hawaii.txt` (daily append ~21:00Z,
   sends ETag/Last-Modified). Market: "Will Hawaii reach Coral Bleaching Alert
   Level 1 by Dec 31 2026" (DHW ≥ 4). DHW was ~0.43 at setup, so no trigger is
@@ -106,16 +126,27 @@ that usually times out — expected noise.
 
 1. ~~Verify 304 responses on repeat polls of `hawaii.txt`~~ — done
    2026-11-07 (see Environment findings).
-2. Find higher-cadence data-release markets (daily/weekly official stats,
-   scheduled macro prints) — daily origins give too few race events to
-   measure an edge. `list --zero-delay --url-only` produces the candidate
-   shortlist.
-3. Add a Python analysis script over `data/*.jsonl` (latency histograms,
-   depth-at-quote before/after).
-4. Upgrade the harness to `docs/MEASUREMENT-SPEC.md`: forward-walk sampling
-   (+0…+500 ms, PHANTOM_EDGE vs EXECUTABLE_EDGE verdicts), publication
-   uncertainty-window logging, CDN header capture (`CF-Cache-Status`/`Age`),
-   book-health state machine, monotonic-clock timestamps.
-5. Only if logs show a repeatable window: revisit scope (execution is a
+2. ~~Find higher-cadence data-release markets~~ — done 2026-11-07. Full
+   scan: 6,689 zero-delay URL-source markets, 413 recurring series
+   (`scripts/scan_candidates.py`). Selected target family: **USGS
+   daily biggest-earthquake bins** (12 instances, daily cadence, live
+   GeoJSON feed, token ids in `configs/earthquake-2026-11-07.json`).
+3. ~~Python analysis scripts~~ — done 2026-11-07:
+   `scripts/analyze_races.py` (latency histogram, forward-walk EV decay,
+   uncertainty/CDN/book-health stats) and `scripts/scan_candidates.py`
+   (recurring-series detection over `list` TSV).
+4. ~~Upgrade the harness to `docs/MEASUREMENT-SPEC.md`~~ — done
+   2026-11-07: forward-walk sampler with VWAP sweeps and verdicts
+   (`crates/engine/src/walk.rs`), publication uncertainty window +
+   per-poll stage breakpoints, CDN header capture, book-health state
+   machine, monotonic clocks end-to-end, non-blocking logger with drop
+   counter. 24/24 tests pass; live smoke verified.
+5. **Open:** collect 5+ releases of the earthquake series and score them
+   against the go/no-go card (`scripts/analyze_races.py`). Known risk:
+   `all_day.geojson` is served from CloudFront with `max-age=60` —
+   `X-Cache: Hit` responses may be up to 60 s stale, which per the spec
+   voids measurements in the release window. Candidate fix: poll the FDSN
+   query endpoint instead (observed `X-Cache: Miss` = dynamic).
+6. Only if logs show a repeatable window: revisit scope (execution is a
    separate, explicit decision gated by the spec's scorecard — nothing here
    should accrete it silently).

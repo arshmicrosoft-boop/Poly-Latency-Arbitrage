@@ -2,7 +2,7 @@
 //! `last_trade_price` events. Timestamps are taken at message receipt so the
 //! engine can measure origin-flip -> book-move latency.
 
-use std::time::SystemTime;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -12,7 +12,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 
 pub struct FeedMsg {
-    pub recv_at: SystemTime,
+    /// Monotonic receipt time (spec §3: all latency differences use the
+    /// local monotonic clock; the engine converts to wall time for logging).
+    pub recv_at: Instant,
     pub event: WsEvent,
 }
 
@@ -137,7 +139,7 @@ pub async fn run_market_feed(token_ids: Vec<String>, tx: mpsc::Sender<FeedMsg>) 
         .context("ws subscribe")?;
 
     while let Some(msg) = read.next().await {
-        let recv_at = SystemTime::now();
+        let recv_at = Instant::now();
         let msg = msg.context("ws message")?;
         match msg {
             Message::Text(t) => {
