@@ -1,176 +1,442 @@
-# cashcat
+# Poly-Latency Arbitrage
 
-Dry-run latency-arbitrage **measurement harness** for Polymarket data-release
-markets. **Read-only by design**: it subscribes to the public CLOB WebSocket
-book feed and polls public origin endpoints, then logs JSONL measuring whether
-the order book moves after the origin data changes, and how fast.
+Think of this as a **short-horizon event-driven relative-value strategy**, not a “scraper bot.” The hypothesis is that prediction-market quotes impound new public information with a delay; your system measures whether that delay leaves a risk-adjusted, executable profit after transaction costs and adverse selection. A proper quant workflow separates signal generation, execution assumptions, risk limits, and out-of-sample validation rather than treating a positive-looking backtest as proof. [info.arkm](https://info.arkm.com/research/trading-systems-automations-algorithms-copy-trading-and-crypto-trading-bots)
 
-There is **no wallet, no signing, and no order-placement code path**. If the
-logs never show a tradeable window, that is the answer, and nothing here
-should grow an execution path.
+## The economic hypothesis
 
-## Layout
+For a market \(m\) tied to a public release \(r\), define the market’s implied probability \(P_m(t)\) and the “true” post-release probability \(P^*_r\).
 
-```
-crates/clob     read-only Polymarket client: /sampling-markets discovery,
-                /book snapshots, WSS market-channel feed (book, price_change)
-crates/feeds    HttpPoller: conditional-GET polling (ETag/If-Modified-Since)
-                with body-SHA256 fallback; 200 ms interval floor
-crates/engine   cashcat binary: `list` (market discovery) and `watch`
-                (race logger: origin flip -> book move latency)
-configs/        per-experiment watch configs (see coral-hawaii.json)
-data/           JSONL session logs (gitignored)
-```
+Your null hypothesis is:
 
-## Usage
+\[
+H_0:\quad P_m(t)=P^*_r \quad \text{for all }t\geq t_{\text{publication}}
+\]
 
-```bash
-# Discover active markets; --url-only keeps API-resolvable candidates
-cargo run -p cashcat -- list --max-pages 8 --url-only
-cargo run -p cashcat -- list --regex "(?i)(noaa|tsa|box office)"
+Your alternative hypothesis is:
 
-# Instant-matching markets only (seconds_delay == 0; delayed markets are not
-# snipeable — docs/EXECUTION-REFERENCE.md §1). Combine with --url-only to get
-# the actionable shortlist.
-cargo run -p cashcat -- list --zero-delay --url-only
+\[
+H_A:\quad P_m(t)<P^*_r
+\quad \text{for some interval } t\in[t_{\text{publication}},t_{\text{repriced}})
+\]
 
-# Run the race logger (Ctrl-C to stop; log lands in data/race-<ts>.jsonl)
-cargo run -p cashcat -- watch --config configs/coral-hawaii.json
-```
+You are not claiming you can predict the future. You are claiming that, conditional on a clean release, the market’s conditional probability is temporarily inconsistent with the newly public state of the world.
 
-## Docs (ingested from `docs/context.md`, 2026-11-07)
+## Signal definition
 
-| file | contents |
-| --- | --- |
-| [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) | strategy thesis: Dead-Man's Window, target categories, two-plane architecture |
-| [`docs/MEASUREMENT-SPEC.md`](docs/MEASUREMENT-SPEC.md) | v1 falsification standard: uncertainty windows, book-health gating, forward-walk protocol, go/no-go scorecard |
-| [`docs/EXECUTION-REFERENCE.md`](docs/EXECUTION-REFERENCE.md) | deferred v2 mechanics (DO NOT BUILD until the scorecard passes) |
-| [`docs/context.md`](docs/context.md) | raw source dump the three docs above were ingested from (kept verbatim) |
+A signal is not “the API changed.” It is a validated state transition:
 
-### Config format (`watch --config`)
+\[
+S_i =
+\mathbf{1}\{
+\text{source authoritative}
+\wedge
+\text{schema valid}
+\wedge
+\text{value maps deterministically}
+\wedge
+\text{market open}
+\wedge
+\text{book healthy}
+\}
+\]
 
-```json
-{
-  "window_s": 60,        // how long to wait for a book move after origin flip
-  "heartbeat_s": 30,
-  "data_dir": "data",
-  // Pre-declared spec fields (docs/MEASUREMENT-SPEC.md §5/§6, anti-overfitting):
-  "target_notional_usd": 10.0,  // simulated sweep size
-  "cap_price": 0.95,            // never sweep above this
-  "taker_fee_bps": 0,           // fee on winnings (source claims 2% = 200 bps)
-  "min_depth_usd": 25.0,        // depth required at the quote for a "material" move
-  "min_profit_usd": 1.0,        // net_if_win needed at +100/+250ms for EXECUTABLE_EDGE
-  "book_stale_after_s": 120,    // healthy book with no updates for this long → StaleFeed
-  "targets": [{
-    "id": "human-readable-id",
-    "token_id": "<CLOB ERC-1155 token id of the outcome to track>",
-    "note": "resolution criteria, cadence, expectations",
-    "origin": { "url": "https://...", "interval_ms": 5000 }
-  }]
+Every observation must resolve to one of:
+
+\[
+S_i\in\{\text{valid signal},\text{no signal},\text{ambiguous},\text{parse failure},\text{stale cache}\}
+\]
+
+This distinction matters because your denominator is not “number of times the bot fired.” It is the number of **eligible release events**. If you only log successful signals, you implicitly condition on your own system working—which biases the edge upward.
+
+## The timing model
+
+Polling creates an interval, not an instant. If the prior poll returned old state at \(t^-_i\), and the next poll first returns new state at \(t^+_i\), the true publication time lies in:
+
+\[
+t_{\text{pub},i}\in[t^-_i,t^+_i]
+\]
+
+So the conservative estimate of your informational lead is:
+
+\[
+\widehat{\Delta}_i^{\text{cons}}
+=
+t_{\text{react},i}
+-
+t^-_i
+\]
+
+not:
+
+\[
+t_{\text{react},i}-t^+_i
+\]
+
+The first version assumes the source changed immediately after your previous request. That is deliberately pessimistic: if the edge survives it, the result is more credible.
+
+Your execution path is:
+
+\[
+T_{\text{you}}
+=
+T_{\text{detect}}
++
+T_{\text{parse}}
++
+T_{\text{decide}}
++
+T_{\text{transit}}
++
+T_{\text{match}}
+\]
+
+The opportunity exists only if:
+
+\[
+T_{\text{react},i}>T_{\text{you},i}
+\]
+
+But that is necessary, not sufficient. The quote must also still be there when your order would arrive.
+
+## From price change to PnL
+
+Do not measure “the ask moved from 65 cents to 99 cents.” Measure the **executable VWAP** available after a realistic delay.
+
+For a buy of the winning outcome, let the ask ladder at time \(t_i+\tau\) be:
+
+\[
+\mathcal{A}_i(\tau)=\{(q_{k},a_{k})\}_{k=1}^{K}
+\]
+
+where \(q_k\) is price and \(a_k\) is available size. For target notional \(N\), the simulated fill is:
+
+\[
+Q_i(\tau)=\sum_{k=1}^{K} q_k a_k
+\quad\text{s.t.}\quad
+\sum_{k=1}^{K} a_k\geq \frac{N}{\bar q_i(\tau)}
+\]
+
+The VWAP is:
+
+\[
+\bar q_i(\tau)
+=
+\frac{\sum_k q_k a_k}{\sum_k a_k}
+\]
+
+For a binary contract that resolves to \(1\), expected gross profit per share is:
+
+\[
+1-\bar q_i(\tau)
+\]
+
+After costs \(\phi\), the conservative edge is:
+
+\[
+e_i(\tau)
+=
+1-\bar q_i(\tau)-\phi
+\]
+
+And the executable edge condition is:
+
+\[
+\boxed{
+e_i(\tau)>0
+\quad\land\quad
+\text{Depth}_i(\tau)\geq D_{\min}
+\quad\land\quad
+\text{BookHealth}_i(\tau)=\text{Healthy}
 }
+\]
+
+If \(e_i(0)>0\) but \(e_i(100\text{ ms})\leq0\), classify it as `PHANTOM_EDGE`. It may have looked tradeable in a log, but it was not executable at your realistic latency.
+
+## The full event PnL
+
+For each eligible event \(i\), define:
+
+\[
+\Pi_i
+=
+\mathbf{1}\{\text{filled}\}
+\left[
+Q_i
+-
+N_i\bar q_i(\tau_i)
+-
+\phi_i
+-
+L^{\text{adv}}_i
+\right]
+-
+C_i^{\text{ops}}
+\]
+
+where:
+
+- \(Q_i\) = settlement value of filled shares.
+- \(N_i\) = shares acquired.
+- \(\bar q_i(\tau_i)\) = realized or conservatively simulated VWAP.
+- \(\phi_i\) = explicit and implicit transaction costs.
+- \(L^{\text{adv}}_i\) = expected loss from trading against better-informed flow.
+- \(C_i^{\text{ops}}\) = infrastructure, data, and failure costs.
+
+The strategy’s population-level expectation is:
+
+\[
+\boxed{
+\mathbb{E}[\Pi]
+=
+\frac{1}{N}
+\sum_{i=1}^{N}\Pi_i
+}
+\]
+
+But do not judge it by mean PnL alone. With rare, fat-tailed events, estimate the distribution:
+
+\[
+\widehat{\text{VaR}}_\alpha
+=
+\inf\{x:\Pr(\Pi\leq x)\geq\alpha\}
+\]
+
+and expected shortfall:
+
+\[
+\widehat{\text{ES}}_\alpha
+=
+\mathbb{E}[\Pi\mid\Pi\leq\widehat{\text{VaR}}_\alpha]
+\]
+
+A strategy with a positive mean but catastrophic left tail is not automatically viable.
+
+## Statistical test
+
+Your unit of observation is the **independent release event**, not the individual WebSocket message.
+
+Let \(X_i=1\) if event \(i\) produced a conservative executable edge, and \(0\) otherwise. Under a null hypothesis of no edge:
+
+\[
+H_0:p\leq p_0
+\]
+
+where \(p_0\) is the minimum hit rate required for the strategy to clear costs. Test:
+
+\[
+\widehat p=\frac{1}{N}\sum_{i=1}^{N}X_i
+\]
+
+with a one-sided binomial test. More importantly, compute a confidence interval:
+
+\[
+\widehat p\pm z_{\alpha/2}
+\sqrt{\frac{\widehat p(1-\widehat p)}{N}}
+\]
+
+If the lower confidence bound is below your cost-adjusted breakeven hit rate, you do not yet have evidence of an edge.
+
+Also run the analysis out-of-sample: fit nothing on the events used for the final decision. A strategy tuned after seeing the data is vulnerable to overfitting, lookahead bias, and survivorship bias. [info.arkm](https://info.arkm.com/research/trading-systems-automations-algorithms-copy-trading-and-crypto-trading-bots)
+
+## Risk constraints
+
+Before any order, the system must satisfy:
+
+\[
+\boxed{
+\begin{aligned}
+&|x_m|\leq X_m \\
+&\sum_m |x_m|\leq X_{\text{total}} \\
+&\sum_{i\in\text{day}}\Pi_i^- \leq L_{\text{day}} \\
+&\text{BookHealth}=\text{Healthy} \\
+&\text{SignalConfidence}\geq c_{\min} \\
+&\text{KillSwitch}=\text{off}
+\end{aligned}
+}
+\]
+
+The important risk is not that you are wrong about the release. It is that you are right about the release but wrong about the **market’s resolution rule**, liquidity, queue position, or counterparty behavior.
+
+## What the v1 harness measures
+
+| Layer | Quant question | Output |
+|---|---|---|
+| Origin | When did the information become available, within what uncertainty? | Publication interval, detection lag |
+| Parser | Did the source deterministically imply an outcome? | Signal/no-signal/ambiguous |
+| Book | Was the market state trustworthy? | Health, sequence gaps, staleness |
+| Reaction | Did the book materially reprice, and when? | Reaction latency distribution |
+| Liquidity | Was there enough depth at a favorable price? | VWAP, depth, persistence |
+| Execution | Would the trade have survived realistic delay? | Forward-walk edge decay |
+| Economics | Was expected profit positive after costs? | Net edge, fee sensitivity |
+| Statistics | Is the result repeatable across independent events? | Hit rate, confidence interval, out-of-sample result |
+
+## The proper conclusion
+
+Do not say:
+
+> “The origin updated 1.8 seconds before Polymarket, so there is edge.”
+
+Say:
+
+> “Across \(N\) predeclared, independent release events, \(k\%\) produced a conservative executable edge at a \(100\) ms execution delay, with median available depth \(D\), median post-delay VWAP \(q\), and a \(95\%\) confidence interval for the executable-edge rate of \([a,b]\).”
+
+That is the difference between a story and a strategy. A quant system is judged by whether its edge survives realistic costs, execution assumptions, risk limits, and out-of-sample data—not by whether a single latency gap looks impressive. [quantt.co](https://www.quantt.co.uk/resources/quant-trading-complete-guide) It would be called a **low-latency event-driven relative-value strategy with an information-diffusion alpha signal**—more specifically, a **public-information latency arbitrage model** for prediction markets.
+
+## Proper name
+
+```text
+Event-Driven Information-Diffusion Relative-Value Strategy
+for Binary Prediction Markets
 ```
 
-### JSONL event kinds
+Shorter, desk-style name:
 
-| kind            | meaning                                                       |
-| --------------- | ------------------------------------------------------------- |
-| `session_start` | config echo incl. pre-declared spec fields                     |
-| `book_change`   | best bid/ask moved for a tracked token (wall `recv_ms`, `book_health`) |
-| `origin_event`  | every poll (incl. 304s): `changed`, `uncertainty_ms`, stage breakpoints (`stage_ms`), CDN state (`cdn`) |
-| `race_opened`   | origin flip detected; quotes/depth/book-health captured at t0   |
-| `race`          | first book move after an origin flip; `latency_ms` (monotonic), before/after quotes, `material` flag |
-| `forward_walk_sample` | +0…+500 ms offset sweep of the live ask stack (VWAP, cap, fee → `net_if_win`) |
-| `forward_walk_verdict` | `EXECUTABLE_EDGE` / `PHANTOM_EDGE` / `NO_EDGE` per spec   |
-| `race_timeout`  | no verdict within the window; partial samples retained          |
-| `heartbeat`     | quotes, book health + age, pending races, `logger_drops`        |
-| `session_end`   | clean shutdown                                                  |
+```text
+Public-Release Latency Arbitrage (PRLA)
+```
 
-Note: the first poll of each origin is a baseline "change" and opens a race
-that usually times out — expected noise.
+Or, if you want it to sound like an internal quant-desk model:
 
-## Environment findings (2026-11-07)
+```text
+Time-to-Price (T2P) Alpha Model
+```
 
-- **TLS backend is native-tls (SChannel), not rustls.** `ring` fails to
-  compile on this machine's MSVC 14.44 (`cl.exe D8050`). See comment in the
-  root `Cargo.toml`.
-- **`static.crates.io` is intermittently very slow from this machine.**
-  `.cargo/config.toml` relaxes cargo's stall detector; plain `cargo fetch`
-  works, the default settings do not.
-- **`gamma-api.polymarket.com` frequently fails over IPv6 from this machine**
-  (curl exits 000); the CLOB REST/WS hosts are fine. Discovery therefore uses
-  `clob.polymarket.com/sampling-markets`. `/markets` also works but walks
-  from the oldest (closed) markets first.
-- CLOB market docs have inconsistent scalar types (`"price": 0` as an
-  integer on dead markets); the parser is deliberately lenient.
-- `seconds_delay` is present on CLOB `/sampling-markets` docs (verified
-  2026-11-07): 996/1000 markets on the first page are `0`, three are `3`
-  (live-sports taker buffer), one is `1`. Powers `list --zero-delay`.
-- NOAA `hawaii.txt` honours conditional requests: repeat poll with
-  `If-None-Match`/`If-Modified-Since` returns `304 Not Modified` (verified
-  2026-11-07), so steady-state polling costs headers only.
-- USGS `all_day.geojson` sends `Last-Modified` (no ETag) and honours
-  `If-Modified-Since` with 304, but sits behind CloudFront with
-  `Cache-Control: public, max-age=60` — HIT responses can be up to 60 s
-  stale (spec: measurement void in release windows). The FDSN query
-  endpoint (`/fdsnws/event/1/query`) was observed returning
-  `X-Cache: Miss` (dynamic).
-- First live spec-conformant smoke (2026-11-07, earthquake config): 126/129
-  polls were 304s, uncertainty window p50 ≈ 1.1 s (≈ poll interval), one
-  race resolved at 1,056 ms latency, forward-walk verdicts NO_EDGE, book
-  Healthy throughout, 0 logger drops.
-- Polling the same USGS URL from three targets at ~3 req/s aggregate
-  triggered HTTP 429 throttling (648/1410 polls in the second smoke; the
-  single-target 1 req/s first smoke ran clean). Config intervals raised to
-  3000 ms (~1 req/s aggregate). Longer-term fix: dedupe shared origins in
-  the engine so N targets on one URL cost one poll.
-- Body-hash change detection is deliberately coarse: any new quake in
-  `all_day.geojson` opens a race even when the daily-max bin is unchanged
-  (15 races in the second smoke, all from sub-threshold quakes, all
-  NO_EDGE). A magnitude-aware parser would sharpen the signal.
-- First live target: NOAA Coral Reef Watch `hawaii.txt` (daily append ~21:00Z,
-  sends ETag/Last-Modified). Market: "Will Hawaii reach Coral Bleaching Alert
-  Level 1 by Dec 31 2026" (DHW ≥ 4). DHW was ~0.43 at setup, so no trigger is
-  expected; this target validates the plumbing, not the edge.
+## What it actually is
 
-## Next steps
+It is **not** statistical arbitrage in the classic pairs-trading sense, because you are not modeling a stationary spread between two assets. It is closer to an **event-study alpha model**:
 
-1. ~~Verify 304 responses on repeat polls of `hawaii.txt`~~ — done
-   2026-11-07 (see Environment findings).
-2. ~~Find higher-cadence data-release markets~~ — done 2026-11-07. Full
-   scan: 6,689 zero-delay URL-source markets, 413 recurring series
-   (`scripts/scan_candidates.py`). Selected target family: **USGS
-   daily biggest-earthquake bins** (12 instances, daily cadence, live
-   GeoJSON feed, token ids in `configs/earthquake-2026-11-07.json`).
-3. ~~Python analysis scripts~~ — done 2026-11-07:
-   `scripts/analyze_races.py` (latency histogram, forward-walk EV decay,
-   uncertainty/CDN/book-health stats) and `scripts/scan_candidates.py`
-   (recurring-series detection over `list` TSV).
-4. ~~Upgrade the harness to `docs/MEASUREMENT-SPEC.md`~~ — done
-   2026-11-07: forward-walk sampler with VWAP sweeps and verdicts
-   (`crates/engine/src/walk.rs`), publication uncertainty window +
-   per-poll stage breakpoints, CDN header capture, book-health state
-   machine, monotonic clocks end-to-end, non-blocking logger with drop
-   counter. 24/24 tests pass; live smoke verified.
-5. **Open (cannot be closed in one session):** collect 5+ releases of the
-   earthquake series and score them against the go/no-go card
-   (`scripts/analyze_races.py`). Scoring was run on 2026-11-07 against every
-   session collected so far: **0 EXECUTABLE_EDGE, 0 PHANTOM_EDGE, 18
-   NO_EDGE**, 0 resolved races in the second run (1 at 1,056 ms in the
-   first), book healthy at 18/18 walks, 0 logger drops. That is *not* a
-   scorecard pass or failure — none of the observed origin flips was a
-   bin-changing release, so there is no qualifying sample yet. This step
-   needs several days of daily releases to accumulate.
-   Known risks to clear first:
-   - `all_day.geojson` is served from CloudFront with `max-age=60`;
-     `X-Cache: Hit` responses may be up to 60 s stale, which per the spec
-     voids measurements in the release window (758/1410 polls were
-     CDN-served, Age p50 = 32 s). Candidate fix: poll the FDSN query
-     endpoint instead (observed `X-Cache: Miss` = dynamic).
-   - Coarse body-hash change detection opens races on any new quake, so
-     most samples are noise; a magnitude-aware origin parser is needed
-     before the sample count means anything.
-   - Dedupe shared origins in the engine (N targets on one URL should cost
-     one poll) to stay under the USGS rate limit at higher cadence.
-6. Only if logs show a repeatable window: revisit scope (execution is a
-   separate, explicit decision gated by the spec's scorecard — nothing here
-   should accrete it silently).
+\[
+r_{m,t}
+=
+\alpha
++
+\beta \mathbf{1}\{\text{release}\}
++
+\gamma \mathbf{1}\{\text{release}\}\cdot f(\text{latency})
++
+\varepsilon_t
+\]
+
+Your alpha is the interaction term: a release event creates a temporary mispricing, and your ability to capture it depends on detecting the release before the market reprices.
+
+More precisely, it is a **conditional event-study model with an execution-constrained alpha filter**.
+
+## The formal classification
+
+| Component | Quant label |
+|---|---|
+| Strategy family | Event-driven relative value |
+| Alpha source | Information diffusion / public-data latency |
+| Signal type | Deterministic release-triggered state update |
+| Market | Binary prediction contracts / event contracts |
+| Execution style | Liquidity-taking, latency-sensitive |
+| Risk model | Event, liquidity, adverse-selection, and operational risk |
+| Validation | Event-level out-of-sample hypothesis test |
+| Current stage | Alpha research / falsification harness |
+
+So the most accurate one-line title is:
+
+```text
+Low-Latency Event-Driven Information-Diffusion Alpha Model
+for Prediction-Market Liquidity Taking
+```
+
+## How a desk would describe it
+
+A quant researcher would say:
+
+> “We run an event-driven relative-value strategy on binary prediction markets. We identify recurring public-information releases with deterministic resolution rules, estimate the market’s price-discovery lag relative to the primary source, and take liquidity only when the post-signal executable VWAP remains profitable after fees, execution delay, and adverse-selection costs.”
+
+That is the proper version of “Polymarket Time Machine.”
+
+## The model’s formal objective
+
+\[
+\boxed{
+\max_{\tau,x}
+\quad
+\mathbb{E}\!\left[
+\left(v-q_\tau-\phi\right)x_\tau
+-
+L_{\text{adv}}(x_\tau)
+-
+C_{\text{ops}}
+\right]
+}
+\]
+
+subject to:
+
+\[
+\begin{aligned}
+&\Pr(\text{book healthy})\geq1-\epsilon \\
+&x_\tau\leq X_{\max} \\
+&\text{VaR}_\alpha(\Pi)\geq -L_{\max} \\
+&\text{quote persistence}(\tau)\geq P_{\min} \\
+&\text{resolution certainty}=1
+\end{aligned}
+\]
+
+This makes it clear that the model is not “buy the winning side.” It is **selectively provide-less, take-more liquidity only when the event, book state, depth, and execution path jointly satisfy a predeclared profitability constraint**.
+
+## What makes it quant rather than a bot
+
+A bot says:
+
+> “API changed; buy YES.”
+
+Your model says:
+
+> “Conditional on a valid, unambiguous release; a healthy, sequence-consistent book; sufficient post-delay depth; a predeclared repricing threshold; and positive expected value after fees and adverse selection, submit an immediate-or-cancel order with bounded size.”
+
+That conditional structure is what makes it a quant model.
+
+## Best internal codename
+
+If you want something that sounds credible but still has personality:
+
+```text
+Project CHRONOS
+Causal High-frequency Resolution
+Observation & Market-order System
+```
+
+Or, more restrained:
+
+```text
+Project LATENCY
+Latency-Aware Trade Execution &
+Notification Yield Analysis
+```
+
+My pick for the actual internal name:
+
+```text
+T2P: Time-to-Price Alpha Engine
+```
+
+Because the entire thesis reduces to one measurable object:
+
+\[
+\boxed{
+\text{T2P}_i
+=
+t_{\text{market repriced},i}
+-
+t_{\text{origin available},i}
+}
+\]
+
+Your strategy is profitable only if:
+
+\[
+\boxed{
+\text{T2P}_i
+>
+T_{\text{you},i}
++
+\text{cost-adjusted margin}
+}
+\]
+
+repeatedly, across independent events, with real executable liquidity. Quant trading is fundamentally about turning data and models into systematic, risk-aware trading decisions—not merely automating a manual trade. [ig](https://www.ig.com/en/trading-strategies/a-traders-guide-to-quantitative-trading-200420)
