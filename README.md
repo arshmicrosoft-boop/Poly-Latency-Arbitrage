@@ -38,13 +38,14 @@ cargo run -p cashcat -- list --zero-delay --url-only
 cargo run -p cashcat -- watch --config configs/coral-hawaii.json
 ```
 
-## Docs (ingested from `context.md`, 2026-11-07)
+## Docs (ingested from `docs/context.md`, 2026-11-07)
 
 | file | contents |
 | --- | --- |
 | [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) | strategy thesis: Dead-Man's Window, target categories, two-plane architecture |
 | [`docs/MEASUREMENT-SPEC.md`](docs/MEASUREMENT-SPEC.md) | v1 falsification standard: uncertainty windows, book-health gating, forward-walk protocol, go/no-go scorecard |
 | [`docs/EXECUTION-REFERENCE.md`](docs/EXECUTION-REFERENCE.md) | deferred v2 mechanics (DO NOT BUILD until the scorecard passes) |
+| [`docs/context.md`](docs/context.md) | raw source dump the three docs above were ingested from (kept verbatim) |
 
 ### Config format (`watch --config`)
 

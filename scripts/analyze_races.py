@@ -78,14 +78,21 @@ def main(paths):
         print(f"\n## forward-walk verdicts, n={len(walks)}")
         for v in ("EXECUTABLE_EDGE", "PHANTOM_EDGE", "NO_EDGE"):
             print(f"  {v:16}: {sum(1 for w in walks if w.get('verdict') == v)}")
+        # Sample offsets carry scheduling jitter; bucket each sample to the
+        # nearest spec offset so the decay curve lines up across sessions.
+        spec_offsets = (0, 25, 50, 100, 250, 500)
+
+        def bucket(off):
+            return min(spec_offsets, key=lambda o: abs(o - off))
+
         ev_by_off = {}
         for e in events:
             if e.get("kind") == "forward_walk_sample":
                 off = e.get("offset_ms")
                 ev = (e.get("sweep") or {}).get("net_if_win")
                 if off is not None and ev is not None:
-                    ev_by_off.setdefault(off, []).append(ev)
-        print("  EV decay by offset (mean / min net_if_win on $notional):")
+                    ev_by_off.setdefault(bucket(off), []).append(ev)
+        print("  EV decay by spec offset (mean / min net_if_win, bucketed):")
         for off in sorted(ev_by_off):
             vs = ev_by_off[off]
             print(f"    +{off:>3} ms: mean={statistics.mean(vs):7.2f}  min={min(vs):7.2f}  n={len(vs)}")

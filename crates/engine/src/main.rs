@@ -418,6 +418,12 @@ async fn watch(path: PathBuf) -> Result<()> {
     let mut origin_seq: u64 = 0;
     let stale_after = Duration::from_secs(cfg.book_stale_after_s.max(10));
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    // Forward-walk offsets need sub-tick resolution: the spec's +0/+25/+50 ms
+    // samples would otherwise land ~1 s late on a 1 s tick (observed in the
+    // first smoke run: all six samples clumped at +1119 ms). 20 ms keeps
+    // offset jitter inside half a bucket.
+    let mut walk_tick = tokio::time::interval(Duration::from_millis(20));
+    walk_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(cfg.heartbeat_s.max(5)));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -511,6 +517,7 @@ async fn watch(path: PathBuf) -> Result<()> {
                     "kind": "race_opened",
                     "origin_id": origin_seq,
                     "target_id": target.id,
+                    "t0_wall_ms": pending.last().unwrap().t0_wall_ms,
                     "ask_before": ask,
                     "bid_before": bid,
                     "depth_ok_at_open": depth_ok,
@@ -518,63 +525,16 @@ async fn watch(path: PathBuf) -> Result<()> {
                     "uncertainty_ms": ev.uncertainty_ms,
                 }));
             }
+            _ = walk_tick.tick() => {
+                advance_walks(&log, &cfg, &mut pending, &mut books);
+            }
             _ = tick.tick() => {
-                // Advance forward-walk samples and time out stale races.
+                // Time out races that produced no verdict within the window.
                 let now = Instant::now();
                 let window = Duration::from_secs(cfg.window_s);
                 let mut i = 0;
                 while i < pending.len() {
-                    let elapsed = now - pending[i].t0;
-                    let target_idx = pending[i].target_idx;
-                    let token_id = cfg.targets[target_idx].token_id.clone();
-
-                    // Sample the book at each fixed offset while offsets remain.
-                    while pending[i].walk_offsets_done < WALK_OFFSETS_MS.len() as u32 {
-                        let off = WALK_OFFSETS_MS[pending[i].walk_offsets_done as usize];
-                        if elapsed >= Duration::from_millis(off) {
-                            let sweep = books.get(&token_id).map_or_else(
-                                || walk::sweep_asks(&[], cfg.target_notional_usd, cfg.cap_price, cfg.taker_fee_bps),
-                                |b| {
-                                    if !matches!(b.health(), BookHealth::Healthy | BookHealth::Stale) {
-                                        pending[i].book_healthy_all = false;
-                                    }
-                                    let asks = b.asks_snapshot();
-                                    walk::sweep_asks(&asks, cfg.target_notional_usd, cfg.cap_price, cfg.taker_fee_bps)
-                                },
-                            );
-                            let offset_ms = elapsed.as_millis();
-                            pending[i].samples.push((offset_ms, sweep.net_if_win));
-                            log.emit(json!({
-                                "kind": "forward_walk_sample",
-                                "origin_id": pending[i].origin_id,
-                                "target_id": cfg.targets[target_idx].id,
-                                "offset_ms": offset_ms,
-                                "sweep": sweep_fields(&sweep),
-                                "book_health": books.get(&token_id).map_or("Missing", |b| b.health().as_str()),
-                            }));
-                            pending[i].walk_offsets_done += 1;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    // All offsets done → verdict; then drop the race.
-                    if pending[i].walk_offsets_done >= WALK_OFFSETS_MS.len() as u32 {
-                        let p = pending.remove(i);
-                        let verdict = walk::judge(&p.samples, cfg.min_profit_usd, p.book_healthy_all);
-                        log.emit(json!({
-                            "kind": "forward_walk_verdict",
-                            "origin_id": p.origin_id,
-                            "target_id": cfg.targets[p.target_idx].id,
-                            "verdict": verdict.as_str(),
-                            "book_healthy_all": p.book_healthy_all,
-                            "min_profit_usd": cfg.min_profit_usd,
-                        }));
-                        continue;
-                    }
-
-                    // Window timeout: no verdict possible past the window.
-                    if elapsed >= window {
+                    if now - pending[i].t0 >= window {
                         let p = pending.remove(i);
                         log.emit(json!({
                             "kind": "race_timeout",
@@ -631,6 +591,72 @@ fn sweep_fields(s: &walk::Sweep) -> Value {
         "fee": s.fee,
         "net_if_win": s.net_if_win,
     })
+}
+
+/// Advance forward-walk sampling for all pending races at the fixed spec
+/// offsets (+0/+25/+50/+100/+250/+500 ms) and emit a verdict once all six
+/// samples are in. Runs on the 20 ms walk tick so sample offsets actually
+/// land near their targets instead of clumping on the 1 s tick.
+fn advance_walks(
+    log: &Jsonl,
+    cfg: &Config,
+    pending: &mut Vec<Pending>,
+    books: &mut HashMap<String, BookTracker>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut i = 0;
+    while i < pending.len() {
+        let elapsed = now - pending[i].t0;
+        let target_idx = pending[i].target_idx;
+        let token_id = cfg.targets[target_idx].token_id.clone();
+
+        while pending[i].walk_offsets_done < WALK_OFFSETS_MS.len() as u32 {
+            let off = WALK_OFFSETS_MS[pending[i].walk_offsets_done as usize];
+            if elapsed >= Duration::from_millis(off) {
+                let sweep = books.get(&token_id).map_or_else(
+                    || walk::sweep_asks(&[], cfg.target_notional_usd, cfg.cap_price, cfg.taker_fee_bps),
+                    |b| {
+                        if !matches!(b.health(), BookHealth::Healthy | BookHealth::Stale) {
+                            pending[i].book_healthy_all = false;
+                        }
+                        let asks = b.asks_snapshot();
+                        walk::sweep_asks(&asks, cfg.target_notional_usd, cfg.cap_price, cfg.taker_fee_bps)
+                    },
+                );
+                let offset_ms = elapsed.as_millis();
+                pending[i].samples.push((offset_ms, sweep.net_if_win));
+                log.emit(json!({
+                    "kind": "forward_walk_sample",
+                    "origin_id": pending[i].origin_id,
+                    "target_id": cfg.targets[target_idx].id,
+                    "offset_ms": offset_ms,
+                    "sweep": sweep_fields(&sweep),
+                    "book_health": books.get(&token_id).map_or("Missing", |b| b.health().as_str()),
+                }));
+                pending[i].walk_offsets_done += 1;
+            } else {
+                break;
+            }
+        }
+
+        if pending[i].walk_offsets_done >= WALK_OFFSETS_MS.len() as u32 {
+            let p = pending.remove(i);
+            let verdict = walk::judge(&p.samples, cfg.min_profit_usd, p.book_healthy_all);
+            log.emit(json!({
+                "kind": "forward_walk_verdict",
+                "origin_id": p.origin_id,
+                "target_id": cfg.targets[p.target_idx].id,
+                "verdict": verdict.as_str(),
+                "book_healthy_all": p.book_healthy_all,
+                "min_profit_usd": cfg.min_profit_usd,
+            }));
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Called after every applied book update: logs best-quote moves and resolves

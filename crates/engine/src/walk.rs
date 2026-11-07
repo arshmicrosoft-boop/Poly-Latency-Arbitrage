@@ -80,9 +80,15 @@ impl Verdict {
 /// Offsets follow the spec: edge must persist at +100 ms AND +250 ms with the
 /// book continuously healthy to be executable; profitable at +0 ms but dead
 /// by +100 ms is phantom.
+///
+/// Live samples carry scheduler jitter (observed +13 ms for the +0 target,
+/// +119–144 ms for +100), so each spec offset resolves to the NEAREST
+/// sample; exact matching made every live verdict fall through to NoEdge.
 pub fn judge(evs: &[(u128, f64)], min_profit: f64, healthy_all: bool) -> Verdict {
     let ev_at = |ms: u128| -> Option<f64> {
-        evs.iter().find(|(o, _)| *o == ms).map(|(_, e)| *e)
+        evs.iter()
+            .min_by_key(|(o, _)| (*o as i64 - ms as i64).unsigned_abs())
+            .map(|(_, e)| *e)
     };
     match (ev_at(0), ev_at(100), ev_at(250)) {
         (Some(e0), Some(e100), Some(e250))
@@ -163,5 +169,15 @@ mod tests {
     fn verdict_no_edge() {
         let evs = vec![(0, 0.2), (25, 0.2), (50, 0.1), (100, 0.0), (250, 0.0), (500, 0.0)];
         assert_eq!(judge(&evs, 1.0, true), Verdict::NoEdge);
+    }
+
+    #[test]
+    fn verdict_tolerates_live_offset_jitter() {
+        // Offsets as observed in a live smoke run (20 ms walk tick).
+        let evs = vec![(14, 8.0), (31, 8.0), (58, 7.5), (112, 7.0), (261, 6.5), (515, 6.0)];
+        assert_eq!(judge(&evs, 1.0, true), Verdict::ExecutableEdge);
+        let phantom = vec![(13, 8.0), (38, 4.0), (61, 0.5), (119, -0.5), (262, 0.0), (536, 0.0)];
+        assert_eq!(judge(&phantom, 1.0, true), Verdict::PhantomEdge);
+        assert_eq!(judge(&[], 1.0, true), Verdict::NoEdge);
     }
 }
