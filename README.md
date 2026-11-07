@@ -151,12 +151,26 @@ that usually times out — expected noise.
    per-poll stage breakpoints, CDN header capture, book-health state
    machine, monotonic clocks end-to-end, non-blocking logger with drop
    counter. 24/24 tests pass; live smoke verified.
-5. **Open:** collect 5+ releases of the earthquake series and score them
-   against the go/no-go card (`scripts/analyze_races.py`). Known risk:
-   `all_day.geojson` is served from CloudFront with `max-age=60` —
-   `X-Cache: Hit` responses may be up to 60 s stale, which per the spec
-   voids measurements in the release window. Candidate fix: poll the FDSN
-   query endpoint instead (observed `X-Cache: Miss` = dynamic).
+5. **Open (cannot be closed in one session):** collect 5+ releases of the
+   earthquake series and score them against the go/no-go card
+   (`scripts/analyze_races.py`). Scoring was run on 2026-11-07 against every
+   session collected so far: **0 EXECUTABLE_EDGE, 0 PHANTOM_EDGE, 18
+   NO_EDGE**, 0 resolved races in the second run (1 at 1,056 ms in the
+   first), book healthy at 18/18 walks, 0 logger drops. That is *not* a
+   scorecard pass or failure — none of the observed origin flips was a
+   bin-changing release, so there is no qualifying sample yet. This step
+   needs several days of daily releases to accumulate.
+   Known risks to clear first:
+   - `all_day.geojson` is served from CloudFront with `max-age=60`;
+     `X-Cache: Hit` responses may be up to 60 s stale, which per the spec
+     voids measurements in the release window (758/1410 polls were
+     CDN-served, Age p50 = 32 s). Candidate fix: poll the FDSN query
+     endpoint instead (observed `X-Cache: Miss` = dynamic).
+   - Coarse body-hash change detection opens races on any new quake, so
+     most samples are noise; a magnitude-aware origin parser is needed
+     before the sample count means anything.
+   - Dedupe shared origins in the engine (N targets on one URL should cost
+     one poll) to stay under the USGS rate limit at higher cadence.
 6. Only if logs show a repeatable window: revisit scope (execution is a
    separate, explicit decision gated by the spec's scorecard — nothing here
    should accrete it silently).
