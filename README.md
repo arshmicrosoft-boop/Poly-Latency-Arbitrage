@@ -8,12 +8,16 @@ For a market $m$ tied to a public release $r$, define the market’s implied pro
 
 Your null hypothesis is:
 
-$$H_0:\quad P_m(t)=P^*_r \quad \text{for all }t\geq t_{\text{publication}}$$
+$$
+H_0:\quad P_m(t)=P^*_r \quad \text{for all }t\geq t_{\text{publication}}
+$$
 
 Your alternative hypothesis is:
 
-$$H_A:\quad P_m(t)<P^*_r
-\quad \text{for some interval } t\in[t_{\text{publication}},t_{\text{repriced}})$$
+$$
+H_A:\quad P_m(t)<P^*_r
+\quad \text{for some interval } t\in[t_{\text{publication}},t_{\text{repriced}})
+$$
 
 You are not claiming you can predict the future. You are claiming that, conditional on a clean release, the market’s conditional probability is temporarily inconsistent with the newly public state of the world.
 
@@ -21,7 +25,8 @@ You are not claiming you can predict the future. You are claiming that, conditio
 
 A signal is not “the API changed.” It is a validated state transition:
 
-$$S_i =
+$$
+S_i =
 \mathbf{1}\{
 \text{source authoritative}
 \wedge
@@ -32,11 +37,14 @@ $$S_i =
 \text{market open}
 \wedge
 \text{book healthy}
-\}$$
+\}
+$$
 
 Every observation must resolve to one of:
 
-$$S_i\in\{\text{valid signal},\text{no signal},\text{ambiguous},\text{parse failure},\text{stale cache}\}$$
+$$
+S_i\in\{\text{valid signal},\text{no signal},\text{ambiguous},\text{parse failure},\text{stale cache}\}
+$$
 
 This distinction matters because your denominator is not “number of times the bot fired.” It is the number of **eligible release events**. If you only log successful signals, you implicitly condition on your own system working—which biases the edge upward.
 
@@ -44,25 +52,32 @@ This distinction matters because your denominator is not “number of times the 
 
 Polling creates an interval, not an instant. If the prior poll returned old state at $t^-_i$, and the next poll first returns new state at $t^+_i$, the true publication time lies in:
 
-$$t_{\text{pub},i}\in[t^-_i,t^+_i]$$
+$$
+t_{\text{pub},i}\in[t^-_i,t^+_i]
+$$
 
 So the conservative estimate of your informational lead is:
 
-$$\widehat{\Delta}_i^{\text{cons}}
+$$
+\widehat{\Delta}_i^{\text{cons}}
 =
 t_{\text{react},i}
 -
-t^-_i$$
+t^-_i
+$$
 
 not:
 
-$$t_{\text{react},i}-t^+_i$$
+$$
+t_{\text{react},i}-t^+_i
+$$
 
 The first version assumes the source changed immediately after your previous request. That is deliberately pessimistic: if the edge survives it, the result is more credible.
 
 Your execution path is:
 
-$$T_{\text{you}}
+$$
+T_{\text{you}}
 =
 T_{\text{detect}}
 +
@@ -72,11 +87,14 @@ T_{\text{decide}}
 +
 T_{\text{transit}}
 +
-T_{\text{match}}$$
+T_{\text{match}}
+$$
 
 The opportunity exists only if:
 
-$$T_{\text{react},i}>T_{\text{you},i}$$
+$$
+T_{\text{react},i}>T_{\text{you},i}
+$$
 
 But that is necessary, not sufficient. The quote must also still be there when your order would arrive.
 
@@ -86,39 +104,51 @@ Do not measure “the ask moved from 65 cents to 99 cents.” Measure the **exec
 
 For a buy of the winning outcome, let the ask ladder at time $t_i+\tau$ be:
 
-$$\mathcal{A}_i(\tau)=\{(q_{k},a_{k})\}_{k=1}^{K}$$
+$$
+\mathcal{A}_i(\tau)=\{(q_{k},a_{k})\}_{k=1}^{K}
+$$
 
 where $q_k$ is price and $a_k$ is available size. For target notional $N$, the simulated fill is:
 
-$$Q_i(\tau)=\sum_{k=1}^{K} q_k a_k
+$$
+Q_i(\tau)=\sum_{k=1}^{K} q_k a_k
 \quad\text{s.t.}\quad
-\sum_{k=1}^{K} a_k\geq \frac{N}{\bar q_i(\tau)}$$
+\sum_{k=1}^{K} a_k\geq \frac{N}{\bar q_i(\tau)}
+$$
 
 The VWAP is:
 
-$$\bar q_i(\tau)
+$$
+\bar q_i(\tau)
 =
-\frac{\sum_k q_k a_k}{\sum_k a_k}$$
+\frac{\sum_k q_k a_k}{\sum_k a_k}
+$$
 
 For a binary contract that resolves to $1$, expected gross profit per share is:
 
-$$1-\bar q_i(\tau)$$
+$$
+1-\bar q_i(\tau)
+$$
 
 After costs $\phi$, the conservative edge is:
 
-$$e_i(\tau)
+$$
+e_i(\tau)
 =
-1-\bar q_i(\tau)-\phi$$
+1-\bar q_i(\tau)-\phi
+$$
 
 And the executable edge condition is:
 
-$$\boxed{
+$$
+\boxed{
 e_i(\tau)>0
 \quad\land\quad
 \text{Depth}_i(\tau)\geq D_{\min}
 \quad\land\quad
 \text{BookHealth}_i(\tau)=\text{Healthy}
-}$$
+}
+$$
 
 If $e_i(0)>0$ but $e_i(100\text{ ms})\leq0$, classify it as `PHANTOM_EDGE`. It may have looked tradeable in a log, but it was not executable at your realistic latency.
 
@@ -126,7 +156,8 @@ If $e_i(0)>0$ but $e_i(100\text{ ms})\leq0$, classify it as `PHANTOM_EDGE`. It m
 
 For each eligible event $i$, define:
 
-$$\Pi_i
+$$
+\Pi_i
 =
 \mathbf{1}\{\text{filled}\}
 \left[
@@ -139,7 +170,8 @@ N_i\bar q_i(\tau_i)
 L^{\text{adv}}_i
 \right]
 -
-C_i^{\text{ops}}$$
+C_i^{\text{ops}}
+$$
 
 where:
 
@@ -152,24 +184,30 @@ where:
 
 The strategy’s population-level expectation is:
 
-$$\boxed{
+$$
+\boxed{
 \mathbb{E}[\Pi]
 =
 \frac{1}{N}
 \sum_{i=1}^{N}\Pi_i
-}$$
+}
+$$
 
 But do not judge it by mean PnL alone. With rare, fat-tailed events, estimate the distribution:
 
-$$\widehat{\text{VaR}}_\alpha
+$$
+\widehat{\text{VaR}}_\alpha
 =
-\inf\{x:\Pr(\Pi\leq x)\geq\alpha\}$$
+\inf\{x:\Pr(\Pi\leq x)\geq\alpha\}
+$$
 
 and expected shortfall:
 
-$$\widehat{\text{ES}}_\alpha
+$$
+\widehat{\text{ES}}_\alpha
 =
-\mathbb{E}[\Pi\mid\Pi\leq\widehat{\text{VaR}}_\alpha]$$
+\mathbb{E}[\Pi\mid\Pi\leq\widehat{\text{VaR}}_\alpha]
+$$
 
 A strategy with a positive mean but catastrophic left tail is not automatically viable.
 
@@ -179,16 +217,22 @@ Your unit of observation is the **independent release event**, not the individua
 
 Let $X_i=1$ if event $i$ produced a conservative executable edge, and $0$ otherwise. Under a null hypothesis of no edge:
 
-$$H_0:p\leq p_0$$
+$$
+H_0:p\leq p_0
+$$
 
 where $p_0$ is the minimum hit rate required for the strategy to clear costs. Test:
 
-$$\widehat p=\frac{1}{N}\sum_{i=1}^{N}X_i$$
+$$
+\widehat p=\frac{1}{N}\sum_{i=1}^{N}X_i
+$$
 
 with a one-sided binomial test. More importantly, compute a confidence interval:
 
-$$\widehat p\pm z_{\alpha/2}
-\sqrt{\frac{\widehat p(1-\widehat p)}{N}}$$
+$$
+\widehat p\pm z_{\alpha/2}
+\sqrt{\frac{\widehat p(1-\widehat p)}{N}}
+$$
 
 If the lower confidence bound is below your cost-adjusted breakeven hit rate, you do not yet have evidence of an edge.
 
@@ -198,7 +242,8 @@ Also run the analysis out-of-sample: fit nothing on the events used for the fina
 
 Before any order, the system must satisfy:
 
-$$\boxed{
+$$
+\boxed{
 \begin{aligned}
 &|x_m|\leq X_m \\
 &\sum_m |x_m|\leq X_{\text{total}} \\
@@ -207,7 +252,8 @@ $$\boxed{
 &\text{SignalConfidence}\geq c_{\min} \\
 &\text{KillSwitch}=\text{off}
 \end{aligned}
-}$$
+}
+$$
 
 The important risk is not that you are wrong about the release. It is that you are right about the release but wrong about the **market’s resolution rule**, liquidity, queue position, or counterparty behavior.
 
@@ -259,7 +305,8 @@ Time-to-Price (T2P) Alpha Model
 
 It is **not** statistical arbitrage in the classic pairs-trading sense, because you are not modeling a stationary spread between two assets. It is closer to an **event-study alpha model**:
 
-$$r_{m,t}
+$$
+r_{m,t}
 =
 \alpha
 +
@@ -267,7 +314,8 @@ $$r_{m,t}
 +
 \gamma \mathbf{1}\{\text{release}\}\cdot f(\text{latency})
 +
-\varepsilon_t$$
+\varepsilon_t
+$$
 
 Your alpha is the interaction term: a release event creates a temporary mispricing, and your ability to capture it depends on detecting the release before the market reprices.
 
@@ -303,7 +351,8 @@ That is the proper version of “Polymarket Time Machine.”
 
 ## The model’s formal objective
 
-$$\boxed{
+$$
+\boxed{
 \max_{\tau,x}
 \quad
 \mathbb{E}\!\left[
@@ -313,17 +362,20 @@ L_{\text{adv}}(x_\tau)
 -
 C_{\text{ops}}
 \right]
-}$$
+}
+$$
 
 subject to:
 
-$$\begin{aligned}
+$$
+\begin{aligned}
 &\Pr(\text{book healthy})\geq1-\epsilon \\
 &x_\tau\leq X_{\max} \\
 &\text{VaR}_\alpha(\Pi)\geq -L_{\max} \\
 &\text{quote persistence}(\tau)\geq P_{\min} \\
 &\text{resolution certainty}=1
-\end{aligned}$$
+\end{aligned}
+$$
 
 This makes it clear that the model is not “buy the winning side.” It is **selectively provide-less, take-more liquidity only when the event, book state, depth, and execution path jointly satisfy a predeclared profitability constraint**.
 
@@ -365,22 +417,26 @@ T2P: Time-to-Price Alpha Engine
 
 Because the entire thesis reduces to one measurable object:
 
-$$\boxed{
+$$
+\boxed{
 \text{T2P}_i
 =
 t_{\text{market repriced},i}
 -
 t_{\text{origin available},i}
-}$$
+}
+$$
 
 Your strategy is profitable only if:
 
-$$\boxed{
+$$
+\boxed{
 \text{T2P}_i
 >
 T_{\text{you},i}
 +
 \text{cost-adjusted margin}
-}$$
+}
+$$
 
 repeatedly, across independent events, with real executable liquidity. Quant trading is fundamentally about turning data and models into systematic, risk-aware trading decisions—not merely automating a manual trade. [ig](https://www.ig.com/en/trading-strategies/a-traders-guide-to-quantitative-trading-200420)
