@@ -29,9 +29,22 @@ data/           JSONL session logs (gitignored)
 cargo run -p cashcat -- list --max-pages 8 --url-only
 cargo run -p cashcat -- list --regex "(?i)(noaa|tsa|box office)"
 
+# Instant-matching markets only (seconds_delay == 0; delayed markets are not
+# snipeable — docs/EXECUTION-REFERENCE.md §1). Combine with --url-only to get
+# the actionable shortlist.
+cargo run -p cashcat -- list --zero-delay --url-only
+
 # Run the race logger (Ctrl-C to stop; log lands in data/race-<ts>.jsonl)
 cargo run -p cashcat -- watch --config configs/coral-hawaii.json
 ```
+
+## Docs (ingested from `context.md`, 2026-11-07)
+
+| file | contents |
+| --- | --- |
+| [`docs/BLUEPRINT.md`](docs/BLUEPRINT.md) | strategy thesis: Dead-Man's Window, target categories, two-plane architecture |
+| [`docs/MEASUREMENT-SPEC.md`](docs/MEASUREMENT-SPEC.md) | v1 falsification standard: uncertainty windows, book-health gating, forward-walk protocol, go/no-go scorecard |
+| [`docs/EXECUTION-REFERENCE.md`](docs/EXECUTION-REFERENCE.md) | deferred v2 mechanics (DO NOT BUILD until the scorecard passes) |
 
 ### Config format (`watch --config`)
 
@@ -78,19 +91,31 @@ that usually times out — expected noise.
   from the oldest (closed) markets first.
 - CLOB market docs have inconsistent scalar types (`"price": 0` as an
   integer on dead markets); the parser is deliberately lenient.
+- `seconds_delay` is present on CLOB `/sampling-markets` docs (verified
+  2026-11-07): 996/1000 markets on the first page are `0`, three are `3`
+  (live-sports taker buffer), one is `1`. Powers `list --zero-delay`.
+- NOAA `hawaii.txt` honours conditional requests: repeat poll with
+  `If-None-Match`/`If-Modified-Since` returns `304 Not Modified` (verified
+  2026-11-07), so steady-state polling costs headers only.
 - First live target: NOAA Coral Reef Watch `hawaii.txt` (daily append ~21:00Z,
   sends ETag/Last-Modified). Market: "Will Hawaii reach Coral Bleaching Alert
   Level 1 by Dec 31 2026" (DHW ≥ 4). DHW was ~0.43 at setup, so no trigger is
   expected; this target validates the plumbing, not the edge.
 
-## Next steps (not built)
+## Next steps
 
-1. Verify 304 responses on repeat polls of `hawaii.txt` (baseline run only
-   observed the initial 200).
+1. ~~Verify 304 responses on repeat polls of `hawaii.txt`~~ — done
+   2026-11-07 (see Environment findings).
 2. Find higher-cadence data-release markets (daily/weekly official stats,
    scheduled macro prints) — daily origins give too few race events to
-   measure an edge.
+   measure an edge. `list --zero-delay --url-only` produces the candidate
+   shortlist.
 3. Add a Python analysis script over `data/*.jsonl` (latency histograms,
    depth-at-quote before/after).
-4. Only if logs show a repeatable window: revisit scope (execution is a
-   separate, explicit decision — nothing here should accrete it silently).
+4. Upgrade the harness to `docs/MEASUREMENT-SPEC.md`: forward-walk sampling
+   (+0…+500 ms, PHANTOM_EDGE vs EXECUTABLE_EDGE verdicts), publication
+   uncertainty-window logging, CDN header capture (`CF-Cache-Status`/`Age`),
+   book-health state machine, monotonic-clock timestamps.
+5. Only if logs show a repeatable window: revisit scope (execution is a
+   separate, explicit decision gated by the spec's scorecard — nothing here
+   should accrete it silently).

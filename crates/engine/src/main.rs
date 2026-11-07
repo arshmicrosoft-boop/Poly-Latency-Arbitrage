@@ -42,6 +42,11 @@ enum Cmd {
         /// Only markets whose question/description contains a URL (API-resolvable candidates).
         #[arg(long)]
         url_only: bool,
+        /// Only markets with seconds_delay == 0 (instant matching). Markets
+        /// with a taker delay (e.g. 3 s on live sports) are not snipeable —
+        /// see docs/EXECUTION-REFERENCE.md §1.
+        #[arg(long)]
+        zero_delay: bool,
     },
     /// Run the race logger: live book feed + origin pollers, JSONL output.
     Watch {
@@ -136,12 +141,14 @@ async fn main() -> Result<()> {
         )
         .init();
     match Cli::parse().cmd {
-        Cmd::List { max_pages, regex, url_only } => list(max_pages, regex, url_only).await,
+        Cmd::List { max_pages, regex, url_only, zero_delay } => {
+            list(max_pages, regex, url_only, zero_delay).await
+        }
         Cmd::Watch { config } => watch(config).await,
     }
 }
 
-async fn list(max_pages: u32, regex: Option<String>, url_only: bool) -> Result<()> {
+async fn list(max_pages: u32, regex: Option<String>, url_only: bool, zero_delay: bool) -> Result<()> {
     let client = clob::client()?;
     let re = regex
         .map(|r| regex::Regex::new(&r))
@@ -167,12 +174,27 @@ async fn list(max_pages: u32, regex: Option<String>, url_only: bool) -> Result<(
             if url_only && !has_url {
                 continue;
             }
+            let delay = m.seconds_delay.clone().unwrap_or_else(|| "?".into());
+            if zero_delay && delay != "0" {
+                continue;
+            }
+            let mut tags = Vec::new();
+            if has_url {
+                tags.push("url-src");
+            }
+            if delay != "0" {
+                tags.push(match delay.as_str() {
+                    "3" => "delay-3s",
+                    "?" => "delay-?",
+                    _ => "delay",
+                });
+            }
             println!(
                 "{}\t{}\t{}\t{}",
                 m.market_slug,
                 m.end_date_iso.clone().unwrap_or_default(),
                 m.question,
-                if has_url { "url-src" } else { "" }
+                tags.join(",")
             );
             shown += 1;
         }

@@ -3,7 +3,8 @@
 //! Decision (2026-11-07): discovery via REST `/markets` + `/sampling-markets`,
 //! live quotes via the WSS market channel (`ws.rs`). This crate has no auth,
 //! no signing and no order placement on purpose: the harness is dry-run only.
-//! rustls everywhere so Windows builds need no OpenSSL.
+//! TLS is native-tls (SChannel on Windows): `ring`/rustls fail to compile on
+//! this machine's MSVC 14.44 — see the root `Cargo.toml` comment.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -90,6 +91,13 @@ pub struct MarketDoc {
     pub minimum_tick_size: f64,
     #[serde(default)]
     pub minimum_order_size: f64,
+    /// Taker-delay (seconds) the matching engine imposes on live markets.
+    /// `0` = instant matching (the only kind worth sniping); `3` = the
+    /// live-sports buffer that kills naive takers. See
+    /// `docs/EXECUTION-REFERENCE.md` §1. Lenient parse: API sends it as a
+    /// number, but string/bool shapes have appeared on other fields.
+    #[serde(default, deserialize_with = "lenient::opt_string")]
+    pub seconds_delay: Option<String>,
     #[serde(default)]
     pub tokens: Vec<MarketToken>,
 }
@@ -241,6 +249,20 @@ mod tests {
         assert!(m.active && !m.closed);
         assert_eq!(m.tokens.len(), 2);
         assert_eq!(m.tokens[0].outcome, "Yes");
+    }
+
+    #[test]
+    fn seconds_delay_lenient() {
+        // Live API sends `"seconds_delay": 3` as a bare number; absent on
+        // many docs. Both shapes must survive page parsing.
+        let m: MarketDoc = serde_json::from_str(
+            r#"{"condition_id":"0x1","question":"q","seconds_delay":3,"tokens":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.seconds_delay.as_deref(), Some("3"));
+        let m: MarketDoc =
+            serde_json::from_str(r#"{"condition_id":"0x1","question":"q","tokens":[]}"#).unwrap();
+        assert!(m.seconds_delay.is_none());
     }
 
     #[test]
