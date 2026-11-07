@@ -118,13 +118,13 @@ The +100 ms sample is the **conservative execution delay** gate — the edge mus
 Polling gives an interval, not an instant. If the previous poll returned old state at `t_prev_req_sent` and the next poll first returns new state at `t_curr_headers_rx`:
 
 $$
-t_{\text{pub}} \in [t_{\text{prev\_req\_sent}},\; t_{\text{curr\_headers\_rx}}]
+t_{\text{pub}} \in [t_{\text{prev\ req\ sent}},\; t_{\text{curr\ headers\ rx}}]
 $$
 
 Conservative analysis assumes the origin changed at the **start** of the window, so the lead is
 
 $$
-\widehat{\Delta}^{\text{cons}} = t_{\text{react}} - t_{\text{prev\_req\_sent}}
+\widehat{\Delta}^{\text{cons}} = t_{\text{react}} - t_{\text{prev\ req\ sent}}
 $$
 
 not `t_react − t_curr_headers_rx`. If the edge survives this pessimism, the result is credible.
@@ -164,7 +164,7 @@ $$
 stopping when the next level exceeds $p_{\text{cap}}$. Then
 
 $$
-\text{net\_if\_win} = (\text{shares} \times \$1.00) - \text{spent} - \text{fee}
+\text{net\ if\ win} = (\text{shares} \times \$1.00) - \text{spent} - \text{fee}
 $$
 
 with `fee = (fee_bps / 10000) × max(0, shares − spent)`. The cap (~\$0.95) guarantees ≥ 5% gross if the outcome holds.
