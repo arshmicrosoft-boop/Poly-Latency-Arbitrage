@@ -13,19 +13,19 @@
       "id": "quake-nov07-under-5.3-YES",
       "token_id": "78087814167373361061467074736844023570431674890748372870118538294333933206927",
       "note": "Biggest quake Nov 7 < 5.3. Origin flips whenever all_day.geojson gains a quake; a 5.3+ quake flips this NO. Currently the most liquid bin.",
-      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 1000 }
+      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 3000 }
     },
     {
       "id": "quake-nov07-6.1-plus-YES",
       "token_id": "14726163803382932303792110042378235938381878236851660599595684542347634160893",
       "note": "Biggest quake Nov 7 >= 6.1. A 6.1+ event anywhere on Earth resolves YES; today's max was 6.1 so this bin is live at ~0.15-0.17.",
-      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 1000 }
+      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 3000 }
     },
     {
       "id": "quake-nov07-5.3-to-5.4-YES",
       "token_id": "86024789673656468144569236602788053531059694941912982727190154442171973725902",
       "note": "Biggest quake Nov 7 in [5.3, 5.4]. Narrow bin; any bigger quake resolves NO.",
-      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 1000 }
+      "origin": { "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson", "interval_ms": 3000 }
     }
   ]
 }

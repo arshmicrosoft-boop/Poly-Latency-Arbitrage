@@ -118,6 +118,15 @@ that usually times out — expected noise.
   polls were 304s, uncertainty window p50 ≈ 1.1 s (≈ poll interval), one
   race resolved at 1,056 ms latency, forward-walk verdicts NO_EDGE, book
   Healthy throughout, 0 logger drops.
+- Polling the same USGS URL from three targets at ~3 req/s aggregate
+  triggered HTTP 429 throttling (648/1410 polls in the second smoke; the
+  single-target 1 req/s first smoke ran clean). Config intervals raised to
+  3000 ms (~1 req/s aggregate). Longer-term fix: dedupe shared origins in
+  the engine so N targets on one URL cost one poll.
+- Body-hash change detection is deliberately coarse: any new quake in
+  `all_day.geojson` opens a race even when the daily-max bin is unchanged
+  (15 races in the second smoke, all from sub-threshold quakes, all
+  NO_EDGE). A magnitude-aware parser would sharpen the signal.
 - First live target: NOAA Coral Reef Watch `hawaii.txt` (daily append ~21:00Z,
   sends ETag/Last-Modified). Market: "Will Hawaii reach Coral Bleaching Alert
   Level 1 by Dec 31 2026" (DHW ≥ 4). DHW was ~0.43 at setup, so no trigger is
