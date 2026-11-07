@@ -1,0 +1,11 @@
+# Slow/unstable route to static.crates.io from this machine (observed
+# ~100 KB/s, intermittent zero-byte transfers). Relax cargo's stall
+# detector and retry harder instead of failing the build.
+
+[net]
+retry = 10
+
+[http]
+low-speed-limit = 0
+multiplexing = false
+timeout = 300

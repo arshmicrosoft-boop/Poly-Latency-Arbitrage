@@ -1,0 +1,21 @@
+[package]
+name = "cashcat"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cashcat"
+path = "src/main.rs"
+
+[dependencies]
+clob = { path = "../clob" }
+feeds = { path = "../feeds" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+regex = "1"

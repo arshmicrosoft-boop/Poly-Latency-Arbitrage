@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/clob", "crates/feeds", "crates/engine"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+# TLS backend decision (2026-11-07): native-tls (SChannel on Windows), not
+# rustls. rustls pulls `ring`, whose C shim fails to build with this machine's
+# MSVC 14.44 (cl.exe D8050 "failed to get command line into debug records").
+# SChannel is pure Rust FFI to the OS, needs no C toolchain, and uses the
+# Windows trust store. Revisit only if this ever needs to cross-compile.
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
